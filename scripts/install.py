@@ -100,6 +100,7 @@ class Installer:
 
     def install_browser(self) -> None:
         if self.dry_run:
+            print("\n[dry-run] would install Playwright Chromium (~300MB)")
             return
         print("\ninstalling Playwright Chromium (one-time, ~300MB)...")
         subprocess.run(["npx", "playwright", "install", "chromium"], cwd=self.root, check=True)
@@ -143,6 +144,7 @@ class Installer:
                 str(port),
             ],
             cwd=self.root,
+            stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -228,6 +230,52 @@ class Installer:
         if target in {"claude", "both"}:
             self.register_claude_mcp()
 
+    # Files left over from removed features. Keep this list narrow — only add
+    # paths that the code no longer reads or writes anywhere.
+    ORPHAN_PATHS: tuple[str, ...] = (
+        ".source-reader/history.db",
+        ".source-reader/history.db-journal",
+        ".source-reader/history.db-wal",
+        ".source-reader/history.db-shm",
+    )
+
+    def list_orphans(self) -> list[tuple[pathlib.Path, int]]:
+        found: list[tuple[pathlib.Path, int]] = []
+        for rel in self.ORPHAN_PATHS:
+            path = self.root / rel
+            if path.exists() and path.is_file():
+                found.append((path, path.stat().st_size))
+        return found
+
+    def clean_orphans(self, assume_yes: bool) -> None:
+        found = self.list_orphans()
+        if not found:
+            print("\nno orphan files to clean.")
+            return
+        print("\nfound orphan files (left over from removed features):")
+        total = 0
+        for path, size in found:
+            print(f"  - {path.relative_to(self.root)}  ({size:,} bytes)")
+            total += size
+        print(f"\ntotal: {total:,} bytes")
+        if self.dry_run:
+            print("[dry-run] would delete the files above; nothing removed.")
+            return
+        if not assume_yes:
+            try:
+                answer = input("\ndelete these files? type 'yes' to confirm: ").strip().lower()
+            except EOFError:
+                answer = ""
+            if answer != "yes":
+                print("aborted; no files deleted.")
+                return
+        for path, _ in found:
+            try:
+                path.unlink()
+                print(f"  deleted: {path.relative_to(self.root)}")
+            except OSError as exc:
+                print(f"  failed: {path.relative_to(self.root)}: {exc}")
+
     def print_summary(self) -> None:
         print(f"root: {self.root}")
         print(f"updated: {len(self.updated)}")
@@ -252,6 +300,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="show intended work without writing files")
     parser.add_argument("--install-core", action="store_true", help="run npm install for source-reader Node modules (no browser)")
     parser.add_argument("--install-browser", action="store_true", help="install Playwright Chromium (one-time, ~300MB)")
+    parser.add_argument("--no-browser", action="store_true", help="skip Playwright Chromium even when --install-mcp implies it")
     parser.add_argument("--install-runtime", action="store_true", help="DEPRECATED: equivalent to --install-core --install-browser; will be removed")
     parser.add_argument("--start-service", action="store_true", help="start local source-reader service after setup")
     parser.add_argument("--install-mcp", action="store_true", help="write project-local MCP config snippets")
@@ -262,6 +311,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="register source-reader MCP in global Codex/Claude client config",
     )
     parser.add_argument("--service-port", type=int, default=8765, help="localhost port for source-reader service")
+    parser.add_argument("--clean-orphans", action="store_true", help="remove files left over from removed features (e.g. history.db); prompts before deleting")
+    parser.add_argument("--yes", action="store_true", help="skip confirmation prompts (only effective with --clean-orphans)")
     return parser.parse_args(argv)
 
 
@@ -279,12 +330,19 @@ def main(argv: list[str]) -> int:
         print("\n[deprecated] --install-runtime is being replaced; use --install-core --install-browser instead.")
     if args.install_core or args.install_runtime:
         installer.install_core()
-    if args.install_browser or args.install_runtime:
+    should_install_browser = (
+        args.install_browser
+        or args.install_runtime
+        or (args.install_mcp and not args.no_browser)
+    )
+    if should_install_browser:
         installer.install_browser()
     if args.register_mcp != "none":
         installer.register_mcp(args.register_mcp)
     if args.start_service:
         installer.start_service(args.service_port)
+    if args.clean_orphans:
+        installer.clean_orphans(args.yes)
     installer.print_summary()
     return 0
 

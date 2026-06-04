@@ -9,7 +9,6 @@ It deliberately prefers cheap, source-specific reads over crawling everything.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
@@ -19,7 +18,6 @@ import json
 import os
 import pathlib
 import re
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -38,8 +36,6 @@ USER_AGENT = "Mozilla/5.0 source-reader/0.1"
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 RUNS_DIR = ROOT_DIR / ".source-reader" / "runs"
-HISTORY_DB = ROOT_DIR / ".source-reader" / "history.db"
-HISTORY_RECENT_DAYS = 7
 DEFAULT_SERVICE_HOST = "127.0.0.1"
 DEFAULT_SERVICE_PORT = 8765
 SERVICE_PID_PATH = ROOT_DIR / ".source-reader" / "source-reader.pid"
@@ -527,50 +523,18 @@ def run_log_path(run_id: str) -> pathlib.Path:
     return RUNS_DIR / f"{run_id}.json"
 
 
-HISTORY_SCHEMA = """
-CREATE TABLE IF NOT EXISTS reads (
-    id INTEGER PRIMARY KEY,
-    run_id TEXT UNIQUE,
-    source TEXT NOT NULL,
-    final_url TEXT,
-    source_type TEXT,
-    title TEXT,
-    fetched_at TEXT,
-    mode TEXT,
-    read_depth TEXT,
-    confidence INTEGER,
-    content_chars INTEGER,
-    auto_upgraded INTEGER,
-    errors_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_reads_source ON reads(source);
-CREATE INDEX IF NOT EXISTS idx_reads_fetched_at ON reads(fetched_at);
-"""
+def recent_reads_from_runs(limit: int = 10) -> list[dict[str, object]]:
+    """Return the N most recent run logs as summary dicts, ordered newest first.
 
-
-def history_db_connect() -> sqlite3.Connection | None:
-    """Open the history db, creating schema and backfilling from run logs on
-    first use. Returns None when sqlite is unavailable for any reason — callers
-    must treat history as a soft dependency."""
-    try:
-        HISTORY_DB.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(HISTORY_DB, timeout=2.0)
-        conn.executescript(HISTORY_SCHEMA)
-        cursor = conn.execute("SELECT COUNT(*) FROM reads")
-        count = cursor.fetchone()[0]
-        if count == 0:
-            history_backfill_from_runs(conn)
-        return conn
-    except sqlite3.Error as exc:
-        sys.stderr.write(f"source-reader history db unavailable: {exc}\n")
-        return None
-
-
-def history_backfill_from_runs(conn: sqlite3.Connection) -> int:
-    if not RUNS_DIR.exists():
-        return 0
-    inserted = 0
-    for path in RUNS_DIR.glob("*.json"):
+    Scans .source-reader/runs/*.json by mtime. This replaces the older sqlite-backed
+    history table — JSON run logs are the single source of truth."""
+    if not RUNS_DIR.exists() or limit <= 0:
+        return []
+    files = sorted(RUNS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    output: list[dict[str, object]] = []
+    for path in files:
+        if len(output) >= limit:
+            break
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -579,130 +543,20 @@ def history_backfill_from_runs(conn: sqlite3.Connection) -> int:
             continue
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
         invocation = payload.get("invocation") if isinstance(payload.get("invocation"), dict) else {}
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO reads(run_id, source, final_url, source_type, title, fetched_at, mode, read_depth, confidence, content_chars, auto_upgraded, errors_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    str(payload.get("run_id") or ""),
-                    str(payload.get("source") or ""),
-                    str(result.get("url") or ""),
-                    str(result.get("source_type") or ""),
-                    str(result.get("title") or ""),
-                    str(result.get("fetched_at") or payload.get("recorded_at") or ""),
-                    str(invocation.get("mode") or ""),
-                    str(result.get("read_depth") or invocation.get("read_depth") or ""),
-                    int(result.get("confidence") or 0),
-                    len(str(result.get("content") or "")),
-                    1 if (result.get("metadata") or {}).get("auto_upgraded") else 0,
-                    json.dumps(result.get("errors") or [], ensure_ascii=False),
-                ),
-            )
-            inserted += 1
-        except sqlite3.Error:
-            continue
-    conn.commit()
-    return inserted
-
-
-def history_record(result: ReaderOutput, source: str, invocation: dict[str, object]) -> None:
-    conn = history_db_connect()
-    if conn is None:
-        return
-    try:
-        conn.execute(
-            "INSERT OR IGNORE INTO reads(run_id, source, final_url, source_type, title, fetched_at, mode, read_depth, confidence, content_chars, auto_upgraded, errors_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                result.run_id,
-                source,
-                result.url,
-                result.source_type,
-                result.title,
-                result.fetched_at,
-                str(invocation.get("mode") or ""),
-                result.read_depth,
-                int(result.confidence or 0),
-                len(result.content or ""),
-                1 if result.metadata.get("auto_upgraded") else 0,
-                json.dumps(result.errors or [], ensure_ascii=False),
-            ),
-        )
-        conn.commit()
-    except sqlite3.Error as exc:
-        sys.stderr.write(f"source-reader history record failed: {exc}\n")
-    finally:
-        with contextlib.suppress(sqlite3.Error):
-            conn.close()
-
-
-def history_lookup(source: str, within_days: int = HISTORY_RECENT_DAYS) -> dict[str, object] | None:
-    if not source:
-        return None
-    conn = history_db_connect()
-    if conn is None:
-        return None
-    try:
-        cutoff = (dt.datetime.now() - dt.timedelta(days=within_days)).isoformat(timespec="seconds")
-        cursor = conn.execute(
-            "SELECT run_id, fetched_at, confidence, mode, read_depth FROM reads "
-            "WHERE source = ? AND fetched_at >= ? ORDER BY fetched_at DESC LIMIT 1",
-            (source, cutoff),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return None
-        return {
-            "run_id": row[0],
-            "fetched_at": row[1],
-            "confidence": row[2],
-            "mode": row[3],
-            "read_depth": row[4],
-        }
-    except sqlite3.Error as exc:
-        sys.stderr.write(f"source-reader history lookup failed: {exc}\n")
-        return None
-    finally:
-        with contextlib.suppress(sqlite3.Error):
-            conn.close()
-
-
-def history_recent(limit: int = 10) -> list[dict[str, object]]:
-    conn = history_db_connect()
-    if conn is None:
-        return []
-    try:
-        cursor = conn.execute(
-            "SELECT run_id, source, source_type, title, fetched_at, mode, read_depth, confidence, content_chars, auto_upgraded, errors_json "
-            "FROM reads ORDER BY fetched_at DESC LIMIT ?",
-            (int(limit),),
-        )
-        rows = cursor.fetchall()
-    except sqlite3.Error as exc:
-        sys.stderr.write(f"source-reader history recent failed: {exc}\n")
-        return []
-    finally:
-        with contextlib.suppress(sqlite3.Error):
-            conn.close()
-    output: list[dict[str, object]] = []
-    for row in rows:
-        try:
-            errors = json.loads(row[10] or "[]")
-        except json.JSONDecodeError:
-            errors = []
+        metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
         output.append(
             {
-                "run_id": row[0],
-                "source": row[1],
-                "source_type": row[2],
-                "title": row[3],
-                "fetched_at": row[4],
-                "mode": row[5],
-                "read_depth": row[6],
-                "confidence": row[7],
-                "content_chars": row[8],
-                "auto_upgraded": bool(row[9]),
-                "errors": errors,
+                "run_id": payload.get("run_id"),
+                "source": payload.get("source"),
+                "source_type": result.get("source_type"),
+                "title": result.get("title"),
+                "fetched_at": result.get("fetched_at") or payload.get("recorded_at"),
+                "mode": invocation.get("mode"),
+                "read_depth": result.get("read_depth") or invocation.get("read_depth"),
+                "confidence": int(result.get("confidence") or 0),
+                "content_chars": len(str(result.get("content") or "")),
+                "auto_upgraded": bool(metadata.get("auto_upgraded")),
+                "errors": result.get("errors") or [],
             }
         )
     return output
@@ -721,7 +575,6 @@ def persist_run_log(result: ReaderOutput, source: str, invocation: dict[str, obj
         "feedback": [],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    history_record(result, source, invocation)
     return path
 
 
@@ -889,28 +742,36 @@ def service_status() -> dict[str, object]:
 
 
 def _profile_last_browser_use() -> tuple[str | None, int | None]:
-    conn = history_db_connect()
-    if conn is None:
+    """Return (fetched_at_iso, age_days) of the most recent browser-mode read.
+
+    Scans .source-reader/runs/*.json by mtime; treats either invocation.mode=='browser'
+    or result.metadata.auto_upgraded as a browser use. age_days is None when the
+    timestamp can't be parsed."""
+    if not RUNS_DIR.exists():
         return None, None
-    try:
-        cursor = conn.execute(
-            "SELECT fetched_at FROM reads WHERE mode = 'browser' OR auto_upgraded = 1 "
-            "ORDER BY fetched_at DESC LIMIT 1"
-        )
-        row = cursor.fetchone()
-    except sqlite3.Error:
-        return None, None
-    finally:
-        with contextlib.suppress(sqlite3.Error):
-            conn.close()
-    if not row or not row[0]:
-        return None, None
-    try:
-        last_used = dt.datetime.fromisoformat(row[0])
-        age_days = (dt.datetime.now() - last_used).days
-        return row[0], max(0, age_days)
-    except ValueError:
-        return row[0], None
+    files = sorted(RUNS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        invocation = payload.get("invocation") if isinstance(payload.get("invocation"), dict) else {}
+        metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        if invocation.get("mode") != "browser" and not metadata.get("auto_upgraded"):
+            continue
+        fetched_at = result.get("fetched_at") or payload.get("recorded_at")
+        if not fetched_at:
+            return None, None
+        try:
+            last_used = dt.datetime.fromisoformat(str(fetched_at))
+            age_days = (dt.datetime.now() - last_used).days
+            return str(fetched_at), max(0, age_days)
+        except ValueError:
+            return str(fetched_at), None
+    return None, None
 
 
 def profile_status() -> dict[str, object]:
@@ -967,7 +828,7 @@ def gather_status(recent_limit: int = 10) -> dict[str, object]:
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "service": service_status(),
         "profile": profile_status(),
-        "recent_reads": history_recent(recent_limit),
+        "recent_reads": recent_reads_from_runs(recent_limit),
         "playwright": playwright_status(),
         "runtime": runtime_status(),
     }
@@ -1784,6 +1645,17 @@ def _try_auto_upgrade(
         result.metadata["auto_upgrade_skipped"] = "browser_profile_missing"
         result.metadata["auto_upgrade_profile_hint"] = profile_path
         return result
+    # When a CLI user (interactive tty) hits an auth wall on the fast path,
+    # auto-open a visible browser and wait for login. Skip for MCP / HTTP
+    # callers (non-tty) to avoid blocking 180s on a headless service.
+    if (
+        not interactive_login
+        and result.metadata.get("blocked_by") == "auth_wall"
+        and sys.stdin.isatty()
+    ):
+        interactive_login = True
+        headless = False
+        result.metadata["auto_interactive_login"] = True
     browser_result = read_browser_url(
         source,
         max_chars,
@@ -1818,7 +1690,6 @@ def classify_and_read(
     auto_upgrade: bool = True,
 ) -> ReaderOutput:
     max_chars = effective_max_chars(max_chars, read_depth)
-    history_hit = history_lookup(source, within_days=HISTORY_RECENT_DAYS)
 
     if not source.startswith(("http://", "https://")):
         result = read_file(source, max_chars)
@@ -1870,8 +1741,6 @@ def classify_and_read(
                     login_timeout_ms,
                 )
 
-    if history_hit:
-        result.metadata["history_hit"] = history_hit
     return attach_interaction(
         result,
         source,
