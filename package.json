@@ -1,0 +1,11 @@
+{
+  "name": "source-reader",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "source:browser": "node scripts/browser_reader.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.56.0"
+  }
+}
