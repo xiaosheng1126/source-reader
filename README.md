@@ -1,21 +1,13 @@
 # Source Reader
 
-source-reader 是独立的智能内容读取器，负责把各种输入读取成 LLM 可用的结构化结果。它可以被知识库、开发任务、代码审查、资料分析或其他 Agent 复用，但自身不维护个人知识库状态。
+**source-reader 是给 Codex / Claude Code 用的本机阅读层，专读云端 reader 进不来的内容：登录态网站、内网文档、本地文件、付费订阅。**
 
-## 为什么独立
+它只解决"如何把复杂输入读进来"，不维护知识库状态，不决定资料是否沉淀，不写 raw/wiki。上层 Agent / 知识库自己消费 reader 输出再决定如何处理。
 
-读取 URL 和读取知识不是同一件事。
-
-- source-reader 解决：如何把复杂输入读进来。
-- knowledge-base 解决：这些信息对用户有什么长期价值。
-
-这样 `读取 <source>` 可以只用于当前任务，`沉淀 <source>` 才进入知识库流程。
-
-source-reader 的边界：
+## 边界
 
 - 做：识别输入类型、选择低成本读取策略、处理 JS 渲染/登录态、输出正文/元数据/质量/下一步操作。
 - 不做：决定资料是否值得长期保存、写 raw、更新 wiki、维护用户知识结构。
-- 可以被上层系统适配：例如知识库系统可以消费 reader 输出再决定是否写入 raw/wiki，但这不是 reader 核心职责。
 
 ## V1 支持范围
 
@@ -39,56 +31,83 @@ source-reader 的边界：
 - 默认 `max_chars=24000`，超出时保留头部和尾部，中间明确标记截断。
 - 支持 `--read-depth preview|standard|full`，先用 `preview` 快速判断是否值得继续。
 
-## 读取模式
+## 三个入口
+
+对外只露这三个：
 
 ```bash
-python3 scripts/source_reader.py <url> --mode fast --format md
-python3 scripts/source_reader.py <url> --mode browser --browser-profile .source-reader/profiles/default --format md
-python3 scripts/source_reader.py <url> --mode auto --browser-profile .source-reader/profiles/default --format md
-python3 scripts/source_reader.py <url> --mode browser --browser-profile .source-reader/profiles/default --interactive-login --format md
-python3 scripts/source_reader.py <url> --mode auto --browser-profile .source-reader/profiles/default --interactive-login --login-timeout-ms 180000 --read-depth preview --format md
-python3 scripts/source_reader.py <url> --mode auto --read-depth preview --format md
-python3 scripts/source_reader.py serve --host 127.0.0.1 --port 8765
-python3 scripts/source_reader.py remote-read <url> --read-depth preview --format md
-python3 scripts/source_reader.py mcp
-python3 scripts/source_reader.py --doctor --format md
+python3 scripts/source_reader.py read <source>       # 直接读
+python3 scripts/source_reader.py serve               # 启动本机 127.0.0.1 HTTP 服务
+python3 scripts/source_reader.py status              # 服务/profile/最近读取/Playwright/runtime 一览
 ```
 
-- `fast`：默认模式，HTTP 读取，成本最低。
-- `browser`：强制使用 Playwright 持久化 profile，适合语雀、飞书、Notion、JS 渲染站点。
-- `auto`：先 `fast`，如果检测到登录墙或 JS 空壳，再切到 `browser`。配合 `--interactive-login` 时，不需要先询问用户是否重试；工具会直接打开持久化浏览器等待登录。
-- `serve`：启动本机 `127.0.0.1` source-reader 服务。外部联网、Playwright、缓存和登录态由服务进程负责。
-- `remote-read`：Agent 日常优先使用这个入口，只访问本机服务，不直接由 Agent 沙箱访问公网。
-- `mcp`：启动 stdio MCP server。支持 MCP 的 Agent 应优先使用这个入口，避免把外部读取做成普通 shell 网络命令。
+`read <source>` 是默认入口，常用 flag：
 
-## 本地服务
+| Flag | 含义 |
+|---|---|
+| `--mode fast\|browser\|auto` | 读取策略（默认 `fast`，confidence 不足时自动升 browser） |
+| `--read-depth preview\|standard\|full` | 预算（默认 `standard`；大资料先 `preview`） |
+| `--remote` | 走本机服务（Agent 沙箱推荐） |
+| `--action <id>` | 执行 action（`continue_deep_read` / `extract_outline` / `extract_code` / `login_with_browser`） |
+| `--feedback good\|bad --run-id ... [--reason ... --expected ...]` | 记录反馈 |
+| `--interactive-login` | browser 模式下等待人工登录 |
+| `--no-auto-upgrade` | 关闭"低 confidence 自动升 browser" |
+| `--format md\|json` | 输出格式 |
+| `--doctor` | 检查 Node/npm/Playwright/profile |
+
+`serve` 子选项：
+
+| Flag | 含义 |
+|---|---|
+| `--mcp` | 改起 stdio MCP server（供 Codex/Claude 的 MCP 客户端用） |
+| `--port` / `--host` | HTTP 端口（默认 8765） |
+
+`status` 子选项：
+
+| Flag | 含义 |
+|---|---|
+| `--recent N` | 最近 N 次读取（默认 10） |
+| `--format md\|json` | 输出格式 |
+
+读取策略：
+
+- `fast`：HTTP 读取，成本最低；confidence < 40 或检测到登录墙/JS 空壳时**自动升 browser**（前提：Playwright 已装、profile 存在）。
+- `browser`：强制 Playwright 持久化 profile，适合语雀、飞书、Notion、JS 渲染站点。
+- `auto`：和 fast 行为相同（保留为别名）。
+
+## 本地服务与 Agent 接入
 
 安装时推荐一次性准备运行时并启动服务：
 
 ```bash
-python3 scripts/install.py --install-runtime --install-mcp --start-service
+python3 scripts/install.py --install-core --install-mcp --start-service
 ```
 
 这会准备：
 
-- Node/npm 项目依赖。
-- Playwright Chromium。
+- Node/npm 项目依赖（`--install-core`）。
 - `.source-reader/profiles/default` 登录态目录。
 - `.source-reader/mcp/` MCP 模板和运行时元数据。
 - `.source-reader/source-reader.pid` 服务 PID。
 - `.source-reader/source-reader.log` 服务日志。
 
-服务只监听 `127.0.0.1`，不会暴露到局域网。后续 Codex / Claude / MCP 应优先调用：
+Playwright Chromium（约 300MB）默认**不装**。需要 browser/auto 模式时再补：
 
 ```bash
-python3 scripts/source_reader.py remote-read <source> --read-depth preview --format md
-python3 scripts/source_reader.py remote-action continue_deep_read --source <source> --format md
+python3 scripts/install.py --install-browser
 ```
 
-支持 MCP 的客户端可以使用：
+服务只监听 `127.0.0.1`，不会暴露到局域网。Codex / Claude / MCP 走：
 
 ```bash
-python3 scripts/source_reader.py mcp
+python3 scripts/source_reader.py read <source> --remote --read-depth preview --format md
+python3 scripts/source_reader.py read <source> --remote --action continue_deep_read --format md
+```
+
+支持 MCP 的客户端用 `serve --mcp`：
+
+```bash
+python3 scripts/source_reader.py serve --mcp
 ```
 
 安装器会在 `.source-reader/mcp/source-reader.runtime.json` 写入当前 source-reader 项目的绝对路径、MCP 命令和本地服务端口；`source-reader.codex.toml`、`source-reader.claude.json` 是接入 Codex / Claude 的配置片段。
@@ -96,7 +115,7 @@ python3 scripts/source_reader.py mcp
 确认要注册到当前机器的全局 Agent 配置时执行：
 
 ```bash
-python3 scripts/install.py --install-runtime --install-mcp --register-mcp both --start-service
+python3 scripts/install.py --install-core --install-mcp --register-mcp both --start-service
 ```
 
 `--register-mcp codex` 会备份并更新 `~/.codex/config.toml`；`--register-mcp claude` 会调用 `claude mcp add --scope user source-reader`。已有同名 MCP 时默认跳过，替换时使用 `--force`。
@@ -136,22 +155,19 @@ MCP tools:
 
 这套“操作”先以稳定数据协议存在，后续可以映射到聊天 UI、Obsidian 命令、Raycast 或快捷指令。
 
-动作可以直接执行：
+动作通过 `read --action <id>` 触发：
 
 ```bash
-python3 scripts/source_reader.py action continue_deep_read --source <source> --format md
-python3 scripts/source_reader.py action extract_outline --source <source> --format md
-python3 scripts/source_reader.py action extract_code --source <source> --format md
-python3 scripts/source_reader.py action login_with_browser --source <source> --format md
+python3 scripts/source_reader.py read <source> --action continue_deep_read --format md
+python3 scripts/source_reader.py read <source> --action extract_outline --format md
+python3 scripts/source_reader.py read <source> --action extract_code --format md
+python3 scripts/source_reader.py read <source> --action login_with_browser --format md
 ```
 
-服务模式下优先使用：
+加 `--remote` 走本机服务：
 
 ```bash
-python3 scripts/source_reader.py remote-action continue_deep_read --source <source> --format md
-python3 scripts/source_reader.py remote-action extract_outline --source <source> --format md
-python3 scripts/source_reader.py remote-action extract_code --source <source> --format md
-python3 scripts/source_reader.py remote-action login_with_browser --source <source> --format md
+python3 scripts/source_reader.py read <source> --remote --action continue_deep_read --format md
 ```
 
 ## 复盘和反馈
@@ -167,59 +183,29 @@ run log 只用于复盘工具表现，不进入任何知识库。它记录输入
 反馈命令：
 
 ```bash
-python3 scripts/source_reader.py feedback mark_good --run-id <run_id>
-python3 scripts/source_reader.py feedback mark_bad --run-id <run_id> --reason "正文不完整" --expected "希望读到正文而不是导航"
+python3 scripts/source_reader.py read --feedback good --run-id <run_id>
+python3 scripts/source_reader.py read --feedback bad --run-id <run_id> --reason "正文不完整" --expected "希望读到正文而不是导航"
 ```
 
-近期复盘：
+近期读取摘要走 `status`：
 
 ```bash
-python3 scripts/source_reader.py review-runs --limit 20 --format md
+python3 scripts/source_reader.py status --recent 20 --format md
 ```
 
-source-reader 可以基于 run log 给出规则建议，但不自动修改代码、全局配置或上层知识库。策略变更需要用户确认。
-
 第一次使用 browser profile 时，需要让 Playwright 打开可见 Chrome，手动登录目标站点。后续同一 profile 会复用登录态。不要直接使用日常 Chrome 主 Profile，避免锁冲突和隐私边界不清。
+
+> [security] `.source-reader/profiles/` 含登录态等敏感凭据，禁止提交 Git、禁止分享项目目录给他人。需要重置时执行 `python3 scripts/source_reader.py profile rotate`，旧 profile 会以 `<name>.bak-<ts>/` 备份保留。
 
 如果页面跳到登录页，使用 `--interactive-login`。工具会等待你在打开的浏览器里扫码或账号登录，然后继续抽取正文。
 
 如果 browser 模式失败，先运行 `python3 scripts/source_reader.py --doctor --format md`。doctor 会检查 Node、npm、Playwright、browser reader 脚本和持久化 profile，并给出下一步命令。
 
-Playwright 是可选依赖；需要 browser 模式时在项目目录安装：
+Playwright 是可选依赖；需要 browser 模式时单独安装：
 
 ```bash
-python3 scripts/install.py --install-runtime --install-mcp --start-service
+python3 scripts/install.py --install-browser
 ```
-
-## 策略配置方向
-
-source-reader 后续可以支持轻量策略配置，但配置只影响“怎么读”，不影响“要不要沉淀”。
-
-建议配置文件：
-
-```json
-{
-  "default_read_depth": "preview",
-  "max_chars": {
-    "preview": 6000,
-    "standard": 24000,
-    "full": 80000
-  },
-  "browser_profile": ".source-reader/profiles/default",
-  "domains": {
-    "github.com": {
-      "repo_strategy": "readme_first",
-      "issue_comment_limit": 12
-    },
-    "yuque.com": {
-      "mode": "auto",
-      "prefer_browser_profile": true
-    }
-  }
-}
-```
-
-短期只建议加入这些策略：默认读取深度、每层 token 预算、域名级读取模式、GitHub issue/PR 评论上限、登录态 profile。不要把用户偏好、知识分类、wiki 目标写进 source-reader 配置。
 
 ## 统一输出
 

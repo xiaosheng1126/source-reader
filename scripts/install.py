@@ -90,13 +90,18 @@ class Installer:
         claude_path.write_text(json.dumps(claude_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         self.updated.append(claude_path)
 
-    def install_runtime(self) -> None:
+    def install_core(self) -> None:
         if self.dry_run:
             return
         if not (self.root / "package.json").exists():
             raise SystemExit(f"package.json does not exist: {self.root / 'package.json'}")
-        print("\ninstalling source-reader runtime...")
+        print("\ninstalling source-reader Node modules...")
         subprocess.run(["npm", "install"], cwd=self.root, check=True)
+
+    def install_browser(self) -> None:
+        if self.dry_run:
+            return
+        print("\ninstalling Playwright Chromium (one-time, ~300MB)...")
         subprocess.run(["npx", "playwright", "install", "chromium"], cwd=self.root, check=True)
 
     def service_pid_path(self) -> pathlib.Path:
@@ -234,6 +239,10 @@ class Installer:
             print(f"Global MCP registered: {', '.join(self.registered_mcp)}")
         else:
             print("Global Codex/Claude MCP registration is intentionally not modified by default.")
+        print(
+            "\n[security] .source-reader/profiles/ 含登录态等敏感凭据，"
+            "禁止提交 Git、禁止分享项目目录给他人。"
+        )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -241,7 +250,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--root", default=str(ROOT), help="source-reader project root")
     parser.add_argument("--force", action="store_true", help="replace existing MCP registrations when needed")
     parser.add_argument("--dry-run", action="store_true", help="show intended work without writing files")
-    parser.add_argument("--install-runtime", action="store_true", help="run npm install and install Playwright Chromium")
+    parser.add_argument("--install-core", action="store_true", help="run npm install for source-reader Node modules (no browser)")
+    parser.add_argument("--install-browser", action="store_true", help="install Playwright Chromium (one-time, ~300MB)")
+    parser.add_argument("--install-runtime", action="store_true", help="DEPRECATED: equivalent to --install-core --install-browser; will be removed")
     parser.add_argument("--start-service", action="store_true", help="start local source-reader service after setup")
     parser.add_argument("--install-mcp", action="store_true", help="write project-local MCP config snippets")
     parser.add_argument(
@@ -265,7 +276,11 @@ def main(argv: list[str]) -> int:
     if args.install_mcp or args.register_mcp != "none":
         installer.write_mcp_runtime_files(args.service_port)
     if args.install_runtime:
-        installer.install_runtime()
+        print("\n[deprecated] --install-runtime is being replaced; use --install-core --install-browser instead.")
+    if args.install_core or args.install_runtime:
+        installer.install_core()
+    if args.install_browser or args.install_runtime:
+        installer.install_browser()
     if args.register_mcp != "none":
         installer.register_mcp(args.register_mcp)
     if args.start_service:

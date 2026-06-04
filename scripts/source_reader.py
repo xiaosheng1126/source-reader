@@ -9,14 +9,17 @@ It deliberately prefers cheap, source-specific reads over crawling everything.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
 import html.parser
 import http.server
 import json
+import os
 import pathlib
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -35,8 +38,21 @@ USER_AGENT = "Mozilla/5.0 source-reader/0.1"
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 RUNS_DIR = ROOT_DIR / ".source-reader" / "runs"
+HISTORY_DB = ROOT_DIR / ".source-reader" / "history.db"
+HISTORY_RECENT_DAYS = 7
 DEFAULT_SERVICE_HOST = "127.0.0.1"
 DEFAULT_SERVICE_PORT = 8765
+SERVICE_PID_PATH = ROOT_DIR / ".source-reader" / "source-reader.pid"
+SERVICE_RUNTIME_PATH = ROOT_DIR / ".source-reader" / "mcp" / "source-reader.runtime.json"
+PROFILE_WARN_DAYS = 14
+PROFILE_CRITICAL_DAYS = 30
+CREDENTIAL_WARNING = (
+    ".source-reader/profiles/ 含登录态等敏感凭据，禁止提交 Git、禁止分享项目目录给他人。"
+)
+
+
+CONFIDENCE_UPGRADE_THRESHOLD = 40
+DEFAULT_BROWSER_PROFILE = ".source-reader/profiles/default"
 
 
 @dataclasses.dataclass
@@ -52,6 +68,7 @@ class ReaderOutput:
     fetched_at: str = dataclasses.field(default_factory=lambda: dt.datetime.now().isoformat(timespec="seconds"))
     reader: str = "scripts/source_reader.py"
     read_quality: str = "basic"
+    confidence: int = 0
     strategy: str = ""
     token_policy: str = ""
     read_depth: str = "standard"
@@ -166,6 +183,56 @@ def extract_lead_points(text: str, limit: int = 5) -> list[str]:
     return points
 
 
+def score_confidence(result: ReaderOutput) -> int:
+    """Compute 0-100 confidence for a read. Higher = the content looks usable."""
+    if result.read_quality == "failed":
+        return 5
+    content = (result.content or "").strip()
+    content_chars = len(content)
+    body_length = result.metadata.get("body_length")
+    if isinstance(body_length, int) and body_length > content_chars:
+        content_chars = body_length
+
+    score = 100
+    if result.read_quality == "blocked":
+        score -= 60
+    elif result.read_quality == "partial":
+        score -= 30
+    if result.metadata.get("maybe_js_rendered"):
+        score -= 35
+    if result.metadata.get("blocked_by") == "auth_wall":
+        score -= 25
+    if content_chars < 200:
+        score -= 40
+    elif content_chars < 600:
+        score -= 15
+    if not extract_headings(content, limit=3):
+        score -= 10
+    if result.errors:
+        score -= min(20, 5 * len(result.errors))
+    return max(0, min(100, score))
+
+
+def playwright_installed() -> bool:
+    return (ROOT_DIR / "node_modules" / "playwright").exists()
+
+
+def resolve_browser_profile(browser_profile: str) -> tuple[str, bool, bool]:
+    """Return (profile_path_str, exists, used_default).
+
+    - If caller passed a profile, use it as-is and report whether it exists.
+    - If caller passed nothing, fall back to DEFAULT_BROWSER_PROFILE; only report
+      'used_default' when the default directory actually exists on disk.
+    """
+    if browser_profile:
+        path = pathlib.Path(browser_profile).expanduser()
+        if not path.is_absolute():
+            path = (ROOT_DIR / path).resolve()
+        return str(path), path.exists(), False
+    default_path = (ROOT_DIR / DEFAULT_BROWSER_PROFILE).resolve()
+    return str(default_path), default_path.exists(), True
+
+
 def build_preview(result: ReaderOutput) -> dict[str, object]:
     content = result.content or ""
     content_chars = len(content)
@@ -176,6 +243,7 @@ def build_preview(result: ReaderOutput) -> dict[str, object]:
         "title": result.title,
         "source_type": result.source_type,
         "read_quality": result.read_quality,
+        "confidence": result.confidence,
         "strategy": result.strategy,
         "content_chars": content_chars,
         "estimated_tokens": estimate_tokens(content),
@@ -327,9 +395,9 @@ def build_next_actions(
             0,
             action(
                 "install_playwright",
-                "安装读取运行时",
-                "安装本地读取运行时并启动服务，之后可读取 JS 渲染或登录态页面。",
-                command="python3 scripts/install.py --install-runtime --start-service",
+                "安装 browser 运行时",
+                "安装 Playwright Chromium（一次性，约 300MB），之后可读取 JS 渲染或登录态页面。",
+                command="python3 scripts/install.py --install-browser",
                 category="setup",
             ),
         )
@@ -377,6 +445,8 @@ def attach_interaction(
     if not result.run_id:
         result.run_id = build_run_id(source)
     result.read_depth = read_depth
+    if not result.confidence:
+        result.confidence = score_confidence(result)
     result.preview = build_preview(result)
     result.actions = build_next_actions(
         result,
@@ -439,7 +509,9 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
     if not npm_ok:
         recommendations.append("Install npm before using browser mode.")
     if not playwright_ok:
-        recommendations.append("Run: python3 scripts/install.py --install-runtime --start-service")
+        recommendations.append(
+            "Browser mode requires Playwright. Run: python3 scripts/install.py --install-browser"
+        )
     if not profile_path.exists():
         recommendations.append(f"Create browser profile directory: {profile_path}")
 
@@ -455,6 +527,187 @@ def run_log_path(run_id: str) -> pathlib.Path:
     return RUNS_DIR / f"{run_id}.json"
 
 
+HISTORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS reads (
+    id INTEGER PRIMARY KEY,
+    run_id TEXT UNIQUE,
+    source TEXT NOT NULL,
+    final_url TEXT,
+    source_type TEXT,
+    title TEXT,
+    fetched_at TEXT,
+    mode TEXT,
+    read_depth TEXT,
+    confidence INTEGER,
+    content_chars INTEGER,
+    auto_upgraded INTEGER,
+    errors_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reads_source ON reads(source);
+CREATE INDEX IF NOT EXISTS idx_reads_fetched_at ON reads(fetched_at);
+"""
+
+
+def history_db_connect() -> sqlite3.Connection | None:
+    """Open the history db, creating schema and backfilling from run logs on
+    first use. Returns None when sqlite is unavailable for any reason — callers
+    must treat history as a soft dependency."""
+    try:
+        HISTORY_DB.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(HISTORY_DB, timeout=2.0)
+        conn.executescript(HISTORY_SCHEMA)
+        cursor = conn.execute("SELECT COUNT(*) FROM reads")
+        count = cursor.fetchone()[0]
+        if count == 0:
+            history_backfill_from_runs(conn)
+        return conn
+    except sqlite3.Error as exc:
+        sys.stderr.write(f"source-reader history db unavailable: {exc}\n")
+        return None
+
+
+def history_backfill_from_runs(conn: sqlite3.Connection) -> int:
+    if not RUNS_DIR.exists():
+        return 0
+    inserted = 0
+    for path in RUNS_DIR.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        invocation = payload.get("invocation") if isinstance(payload.get("invocation"), dict) else {}
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO reads(run_id, source, final_url, source_type, title, fetched_at, mode, read_depth, confidence, content_chars, auto_upgraded, errors_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(payload.get("run_id") or ""),
+                    str(payload.get("source") or ""),
+                    str(result.get("url") or ""),
+                    str(result.get("source_type") or ""),
+                    str(result.get("title") or ""),
+                    str(result.get("fetched_at") or payload.get("recorded_at") or ""),
+                    str(invocation.get("mode") or ""),
+                    str(result.get("read_depth") or invocation.get("read_depth") or ""),
+                    int(result.get("confidence") or 0),
+                    len(str(result.get("content") or "")),
+                    1 if (result.get("metadata") or {}).get("auto_upgraded") else 0,
+                    json.dumps(result.get("errors") or [], ensure_ascii=False),
+                ),
+            )
+            inserted += 1
+        except sqlite3.Error:
+            continue
+    conn.commit()
+    return inserted
+
+
+def history_record(result: ReaderOutput, source: str, invocation: dict[str, object]) -> None:
+    conn = history_db_connect()
+    if conn is None:
+        return
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO reads(run_id, source, final_url, source_type, title, fetched_at, mode, read_depth, confidence, content_chars, auto_upgraded, errors_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                result.run_id,
+                source,
+                result.url,
+                result.source_type,
+                result.title,
+                result.fetched_at,
+                str(invocation.get("mode") or ""),
+                result.read_depth,
+                int(result.confidence or 0),
+                len(result.content or ""),
+                1 if result.metadata.get("auto_upgraded") else 0,
+                json.dumps(result.errors or [], ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        sys.stderr.write(f"source-reader history record failed: {exc}\n")
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            conn.close()
+
+
+def history_lookup(source: str, within_days: int = HISTORY_RECENT_DAYS) -> dict[str, object] | None:
+    if not source:
+        return None
+    conn = history_db_connect()
+    if conn is None:
+        return None
+    try:
+        cutoff = (dt.datetime.now() - dt.timedelta(days=within_days)).isoformat(timespec="seconds")
+        cursor = conn.execute(
+            "SELECT run_id, fetched_at, confidence, mode, read_depth FROM reads "
+            "WHERE source = ? AND fetched_at >= ? ORDER BY fetched_at DESC LIMIT 1",
+            (source, cutoff),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "run_id": row[0],
+            "fetched_at": row[1],
+            "confidence": row[2],
+            "mode": row[3],
+            "read_depth": row[4],
+        }
+    except sqlite3.Error as exc:
+        sys.stderr.write(f"source-reader history lookup failed: {exc}\n")
+        return None
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            conn.close()
+
+
+def history_recent(limit: int = 10) -> list[dict[str, object]]:
+    conn = history_db_connect()
+    if conn is None:
+        return []
+    try:
+        cursor = conn.execute(
+            "SELECT run_id, source, source_type, title, fetched_at, mode, read_depth, confidence, content_chars, auto_upgraded, errors_json "
+            "FROM reads ORDER BY fetched_at DESC LIMIT ?",
+            (int(limit),),
+        )
+        rows = cursor.fetchall()
+    except sqlite3.Error as exc:
+        sys.stderr.write(f"source-reader history recent failed: {exc}\n")
+        return []
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            conn.close()
+    output: list[dict[str, object]] = []
+    for row in rows:
+        try:
+            errors = json.loads(row[10] or "[]")
+        except json.JSONDecodeError:
+            errors = []
+        output.append(
+            {
+                "run_id": row[0],
+                "source": row[1],
+                "source_type": row[2],
+                "title": row[3],
+                "fetched_at": row[4],
+                "mode": row[5],
+                "read_depth": row[6],
+                "confidence": row[7],
+                "content_chars": row[8],
+                "auto_upgraded": bool(row[9]),
+                "errors": errors,
+            }
+        )
+    return output
+
+
 def persist_run_log(result: ReaderOutput, source: str, invocation: dict[str, object]) -> pathlib.Path:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     path = run_log_path(result.run_id)
@@ -468,6 +721,7 @@ def persist_run_log(result: ReaderOutput, source: str, invocation: dict[str, obj
         "feedback": [],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    history_record(result, source, invocation)
     return path
 
 
@@ -540,6 +794,405 @@ def summarize_recent_runs(limit: int = 20) -> dict[str, object]:
         for domain, count in sorted(failure_by_domain.items(), key=lambda item: item[1], reverse=True)
     ]
     return {"status": "ok", "runs": rows, "suggestions": suggestions or ["最近没有明显的重复失败模式。"]}
+
+
+def _dir_size(path: pathlib.Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for entry in path.rglob("*"):
+        try:
+            if entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _humanize_bytes(n: int) -> str:
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def _humanize_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        h, m = divmod(seconds, 3600)
+        return f"{h}h {m // 60}m"
+    days, rem = divmod(seconds, 86400)
+    return f"{days}d {rem // 3600}h"
+
+
+def _short_source(source: str, limit: int = 60) -> str:
+    source = source or ""
+    if len(source) <= limit:
+        return source
+    return source[: limit - 3] + "..."
+
+
+def _service_port() -> int:
+    if SERVICE_RUNTIME_PATH.exists():
+        try:
+            data = json.loads(SERVICE_RUNTIME_PATH.read_text(encoding="utf-8"))
+            port = (data.get("service") or {}).get("port")
+            if port:
+                return int(port)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return DEFAULT_SERVICE_PORT
+
+
+def service_status() -> dict[str, object]:
+    port = _service_port()
+    out: dict[str, object] = {
+        "running": False,
+        "pid": None,
+        "port": port,
+        "uptime_seconds": None,
+        "health_ok": False,
+        "pid_file": str(SERVICE_PID_PATH.relative_to(ROOT_DIR)),
+        "stale_pid": False,
+    }
+    if not SERVICE_PID_PATH.exists():
+        return out
+    try:
+        pid = int(SERVICE_PID_PATH.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return out
+    out["pid"] = pid
+    try:
+        os.kill(pid, 0)
+        out["running"] = True
+    except OSError:
+        out["stale_pid"] = True
+        return out
+    try:
+        out["uptime_seconds"] = max(0, int(dt.datetime.now().timestamp() - SERVICE_PID_PATH.stat().st_mtime))
+    except OSError:
+        pass
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1.5) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            payload = json.loads(body)
+            out["health_ok"] = bool(payload.get("ok"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+        out["health_ok"] = False
+    return out
+
+
+def _profile_last_browser_use() -> tuple[str | None, int | None]:
+    conn = history_db_connect()
+    if conn is None:
+        return None, None
+    try:
+        cursor = conn.execute(
+            "SELECT fetched_at FROM reads WHERE mode = 'browser' OR auto_upgraded = 1 "
+            "ORDER BY fetched_at DESC LIMIT 1"
+        )
+        row = cursor.fetchone()
+    except sqlite3.Error:
+        return None, None
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            conn.close()
+    if not row or not row[0]:
+        return None, None
+    try:
+        last_used = dt.datetime.fromisoformat(row[0])
+        age_days = (dt.datetime.now() - last_used).days
+        return row[0], max(0, age_days)
+    except ValueError:
+        return row[0], None
+
+
+def profile_status() -> dict[str, object]:
+    path_str, exists, _used_default = resolve_browser_profile("")
+    profile_path = pathlib.Path(path_str)
+    last_used, age_days = _profile_last_browser_use()
+    if not exists:
+        health = "missing"
+    elif age_days is None:
+        health = "untested"
+    elif age_days >= PROFILE_CRITICAL_DAYS:
+        health = "critical"
+    elif age_days >= PROFILE_WARN_DAYS:
+        health = "warning"
+    else:
+        health = "ok"
+    return {
+        "path": str(profile_path),
+        "exists": exists,
+        "size_bytes": _dir_size(profile_path),
+        "last_browser_use": last_used,
+        "age_days": age_days,
+        "health": health,
+        "warn_days": PROFILE_WARN_DAYS,
+        "critical_days": PROFILE_CRITICAL_DAYS,
+        "credential_warning": CREDENTIAL_WARNING,
+    }
+
+
+def playwright_status() -> dict[str, object]:
+    installed = playwright_installed()
+    version: str | None = None
+    pkg = ROOT_DIR / "node_modules" / "playwright" / "package.json"
+    if pkg.exists():
+        try:
+            version = json.loads(pkg.read_text(encoding="utf-8")).get("version")
+        except (OSError, json.JSONDecodeError):
+            version = None
+    return {"installed": installed, "version": version}
+
+
+def runtime_status() -> dict[str, object]:
+    sr_dir = ROOT_DIR / ".source-reader"
+    return {
+        "python_version": sys.version.split()[0],
+        "platform": sys.platform,
+        "root": str(ROOT_DIR),
+        "data_dir_size_bytes": _dir_size(sr_dir),
+    }
+
+
+def gather_status(recent_limit: int = 10) -> dict[str, object]:
+    return {
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "service": service_status(),
+        "profile": profile_status(),
+        "recent_reads": history_recent(recent_limit),
+        "playwright": playwright_status(),
+        "runtime": runtime_status(),
+    }
+
+
+def status_to_markdown(report: dict[str, object]) -> str:
+    service = report.get("service") if isinstance(report.get("service"), dict) else {}
+    profile = report.get("profile") if isinstance(report.get("profile"), dict) else {}
+    playwright = report.get("playwright") if isinstance(report.get("playwright"), dict) else {}
+    runtime = report.get("runtime") if isinstance(report.get("runtime"), dict) else {}
+    recent = report.get("recent_reads") if isinstance(report.get("recent_reads"), list) else []
+
+    if service.get("running"):
+        uptime = service.get("uptime_seconds") or 0
+        service_line = f"running (pid {service.get('pid')}, port {service.get('port')}, uptime {_humanize_duration(uptime)})"
+    elif service.get("stale_pid"):
+        service_line = f"stopped (stale pid {service.get('pid')})"
+    else:
+        service_line = "stopped"
+    health_line = "ok" if service.get("health_ok") else ("unreachable" if service.get("running") else "n/a")
+
+    size = _humanize_bytes(int(profile.get("size_bytes") or 0))
+    age_days = profile.get("age_days")
+    if not profile.get("exists"):
+        last_line = "profile missing"
+    elif age_days is None:
+        last_line = "not used for browser reads yet"
+    else:
+        last_line = f"{profile.get('last_browser_use')} ({age_days}d ago)"
+
+    if recent:
+        recent_lines: list[str] = []
+        for r in recent:
+            if not isinstance(r, dict):
+                continue
+            stamp = (r.get("fetched_at") or "")[:16]
+            parts = [
+                stamp,
+                _short_source(str(r.get("source") or "")),
+                str(r.get("source_type") or "?"),
+                f"conf={r.get('confidence', 0)}",
+                f"mode={r.get('mode') or '?'}",
+            ]
+            if r.get("auto_upgraded"):
+                parts.append("auto-upgraded")
+            errors = r.get("errors") if isinstance(r.get("errors"), list) else []
+            if errors:
+                parts.append(f"errors={len(errors)}")
+            recent_lines.append("- " + " | ".join(parts))
+        recent_block = "\n".join(recent_lines)
+    else:
+        recent_block = "- (none)"
+
+    return f"""# Source Reader Status
+
+- Generated at: {report.get('generated_at')}
+
+## Service
+
+- Status: {service_line}
+- Health endpoint: {health_line}
+- Pid file: {service.get('pid_file')}
+
+## Profile (default)
+
+- Path: {profile.get('path')}
+- Exists: {profile.get('exists')}
+- Size: {size}
+- Last browser read: {last_line}
+- Health: {profile.get('health')} (warn >= {profile.get('warn_days')}d, critical >= {profile.get('critical_days')}d)
+
+> {profile.get('credential_warning')}
+
+## Recent Reads (last {len(recent)})
+
+{recent_block}
+
+## Playwright
+
+- Installed: {playwright.get('installed')}
+- Version: {playwright.get('version') or 'n/a'}
+
+## Runtime
+
+- Python: {runtime.get('python_version')} ({runtime.get('platform')})
+- .source-reader/ size: {_humanize_bytes(int(runtime.get('data_dir_size_bytes') or 0))}
+"""
+
+
+def run_status(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Show source-reader status")
+    parser.add_argument("--format", choices=["json", "md"], default="md")
+    parser.add_argument("--recent", type=int, default=10)
+    args = parser.parse_args(argv)
+    report = gather_status(max(0, args.recent))
+    if args.format == "json":
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(status_to_markdown(report))
+    return 0
+
+
+def _profile_dir(name: str) -> pathlib.Path:
+    safe = (name or "default").strip()
+    if not safe or "/" in safe or safe.startswith("."):
+        raise SystemExit(f"invalid profile name: {name!r}")
+    return (ROOT_DIR / ".source-reader" / "profiles" / safe).resolve()
+
+
+def _count_files(path: pathlib.Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for entry in path.rglob("*") if entry.is_file())
+
+
+def profile_info(name: str = "default") -> dict[str, object]:
+    profile_path = _profile_dir(name)
+    exists = profile_path.exists()
+    last_used, age_days = (None, None)
+    if name == "default":
+        last_used, age_days = _profile_last_browser_use()
+    if not exists:
+        health = "missing"
+    elif age_days is None:
+        health = "untested"
+    elif age_days >= PROFILE_CRITICAL_DAYS:
+        health = "critical"
+    elif age_days >= PROFILE_WARN_DAYS:
+        health = "warning"
+    else:
+        health = "ok"
+    return {
+        "name": name,
+        "path": str(profile_path),
+        "exists": exists,
+        "size_bytes": _dir_size(profile_path),
+        "file_count": _count_files(profile_path),
+        "last_browser_use": last_used,
+        "age_days": age_days,
+        "health": health,
+        "warn_days": PROFILE_WARN_DAYS,
+        "critical_days": PROFILE_CRITICAL_DAYS,
+        "credential_warning": CREDENTIAL_WARNING,
+    }
+
+
+def profile_rotate(name: str = "default") -> dict[str, object]:
+    profile_path = _profile_dir(name)
+    profiles_dir = profile_path.parent
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    backup_path: pathlib.Path | None = None
+    had_content = profile_path.exists() and any(profile_path.iterdir())
+    if had_content:
+        ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = profiles_dir / f"{name}.bak-{ts}"
+        profile_path.rename(backup_path)
+    elif profile_path.exists():
+        profile_path.rmdir()
+    profile_path.mkdir(parents=True, exist_ok=True)
+    return {
+        "name": name,
+        "profile_path": str(profile_path),
+        "backup_path": str(backup_path) if backup_path else None,
+        "had_content": had_content,
+        "note": "下次浏览器读取需要在打开的窗口重新登录目标站点。",
+        "credential_warning": CREDENTIAL_WARNING,
+    }
+
+
+def profile_info_to_markdown(info: dict[str, object]) -> str:
+    age_days = info.get("age_days")
+    if not info.get("exists"):
+        last_line = "profile missing"
+    elif age_days is None:
+        last_line = "not used for browser reads yet"
+    else:
+        last_line = f"{info.get('last_browser_use')} ({age_days}d ago)"
+    return f"""# Source Reader Profile: {info.get('name')}
+
+- Path: {info.get('path')}
+- Exists: {info.get('exists')}
+- Size: {_humanize_bytes(int(info.get('size_bytes') or 0))}
+- Files: {info.get('file_count')}
+- Last browser read: {last_line}
+- Health: {info.get('health')} (warn >= {info.get('warn_days')}d, critical >= {info.get('critical_days')}d)
+
+> {info.get('credential_warning')}
+"""
+
+
+def profile_rotate_to_markdown(report: dict[str, object]) -> str:
+    backup_line = (
+        f"- Backup: {report.get('backup_path')}"
+        if report.get("backup_path")
+        else "- Backup: (no prior content to back up)"
+    )
+    return f"""# Source Reader Profile Rotated: {report.get('name')}
+
+- New empty profile: {report.get('profile_path')}
+{backup_line}
+- {report.get('note')}
+
+> {report.get('credential_warning')}
+"""
+
+
+def run_profile(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Inspect or rotate the source-reader browser profile")
+    parser.add_argument("action", choices=["info", "rotate"])
+    parser.add_argument("--name", default="default")
+    parser.add_argument("--format", choices=["json", "md"], default="md")
+    args = parser.parse_args(argv)
+    if args.action == "info":
+        report = profile_info(args.name)
+        if args.format == "json":
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(profile_info_to_markdown(report))
+        return 0
+    report = profile_rotate(args.name)
+    if args.format == "json":
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(profile_rotate_to_markdown(report))
+    return 0
 
 
 def request_url(url: str) -> tuple[bytes, str, str]:
@@ -654,6 +1307,21 @@ def read_browser_url(
     interactive_login: bool = False,
     login_timeout_ms: int = 180000,
 ) -> ReaderOutput:
+    if not playwright_installed():
+        return ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title=url,
+            url=url,
+            read_quality="failed",
+            strategy="playwright_persistent_profile",
+            token_policy=token_policy(max_chars, False),
+            content="",
+            metadata={"browser_profile": str(pathlib.Path(browser_profile).expanduser())},
+            errors=[
+                "Playwright is not installed. Run: python3 scripts/install.py --install-browser",
+            ],
+        )
     script = SCRIPT_DIR / "browser_reader.mjs"
     command = [
         "node",
@@ -1078,6 +1746,66 @@ def effective_max_chars(max_chars: int, read_depth: str) -> int:
     return READ_DEPTH_BUDGETS[read_depth]
 
 
+def _auto_upgrade_reason(result: ReaderOutput) -> str:
+    if result.metadata.get("blocked_by") == "auth_wall":
+        return "auth_wall"
+    if result.metadata.get("maybe_js_rendered"):
+        return "js_shell"
+    return "low_confidence"
+
+
+def _should_auto_upgrade(result: ReaderOutput) -> bool:
+    if result.confidence < CONFIDENCE_UPGRADE_THRESHOLD:
+        return True
+    if result.metadata.get("blocked_by") == "auth_wall":
+        return True
+    if result.metadata.get("maybe_js_rendered"):
+        return True
+    return False
+
+
+def _try_auto_upgrade(
+    result: ReaderOutput,
+    source: str,
+    max_chars: int,
+    browser_profile: str,
+    headless: bool,
+    interactive_login: bool,
+    login_timeout_ms: int,
+) -> ReaderOutput:
+    """Try to upgrade a fast read to a browser read. Mutates `result.metadata`
+    with skip reasons when upgrade is impossible; returns the new result when
+    upgraded."""
+    profile_path, profile_exists, used_default = resolve_browser_profile(browser_profile)
+    if not playwright_installed():
+        result.metadata["auto_upgrade_skipped"] = "playwright_not_installed"
+        return result
+    if not profile_exists:
+        result.metadata["auto_upgrade_skipped"] = "browser_profile_missing"
+        result.metadata["auto_upgrade_profile_hint"] = profile_path
+        return result
+    browser_result = read_browser_url(
+        source,
+        max_chars,
+        profile_path,
+        headless=headless,
+        interactive_login=interactive_login,
+        login_timeout_ms=login_timeout_ms,
+    )
+    browser_result.metadata["fast_reader"] = {
+        "read_quality": result.read_quality,
+        "confidence": result.confidence,
+        "final_url": result.url,
+        "maybe_js_rendered": result.metadata.get("maybe_js_rendered", False),
+        "errors": result.errors,
+    }
+    browser_result.metadata["auto_upgraded"] = True
+    browser_result.metadata["auto_upgrade_reason"] = _auto_upgrade_reason(result)
+    if used_default:
+        browser_result.metadata["browser_profile_default"] = True
+    return browser_result
+
+
 def classify_and_read(
     source: str,
     max_chars: int = DEFAULT_MAX_CHARS,
@@ -1087,97 +1815,73 @@ def classify_and_read(
     interactive_login: bool = False,
     login_timeout_ms: int = 180000,
     read_depth: str = "standard",
+    auto_upgrade: bool = True,
 ) -> ReaderOutput:
     max_chars = effective_max_chars(max_chars, read_depth)
-    if not source.startswith(("http://", "https://")):
-        return attach_interaction(
-            read_file(source, max_chars),
-            source,
-            read_depth,
-            mode,
-            browser_profile,
-            headless,
-            interactive_login,
-            login_timeout_ms,
-        )
+    history_hit = history_lookup(source, within_days=HISTORY_RECENT_DAYS)
 
-    if mode == "browser":
+    if not source.startswith(("http://", "https://")):
+        result = read_file(source, max_chars)
+    elif mode == "browser":
         if not browser_profile:
-            return attach_interaction(
-                ReaderOutput(
-                    input_type="url",
-                    source_type="webpage",
-                    title=source,
-                    url=source,
-                    read_quality="failed",
-                    strategy="playwright_persistent_profile",
-                    token_policy=token_policy(max_chars, False),
-                    content="",
-                    errors=["--browser-profile is required when --mode browser is used."],
-                ),
-                source,
-                read_depth,
-                mode,
-                browser_profile,
-                headless,
-                interactive_login,
-                login_timeout_ms,
+            result = ReaderOutput(
+                input_type="url",
+                source_type="webpage",
+                title=source,
+                url=source,
+                read_quality="failed",
+                strategy="playwright_persistent_profile",
+                token_policy=token_policy(max_chars, False),
+                content="",
+                errors=["--browser-profile is required when --mode browser is used."],
             )
-        return attach_interaction(
-            read_browser_url(
+        else:
+            result = read_browser_url(
                 source,
                 max_chars,
                 browser_profile,
                 headless=headless,
                 interactive_login=interactive_login,
                 login_timeout_ms=login_timeout_ms,
-            ),
-            source,
-            read_depth,
-            mode,
-            browser_profile,
-            headless,
-            interactive_login,
-            login_timeout_ms,
-        )
+            )
+    else:
+        parsed = urllib.parse.urlparse(source)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        if host in {"github.com", "gist.github.com"}:
+            result = read_github(source, max_chars)
+        elif "youtube.com" in host or "youtu.be" in host or "bilibili.com" in host:
+            result = read_video(source, max_chars)
+        elif host in {"news.ycombinator.com", "www.reddit.com", "reddit.com", "v2ex.com", "www.v2ex.com"} or host.endswith(".reddit.com"):
+            result = read_discussion(source, max_chars)
+        elif path.endswith(".pdf") or "arxiv.org/pdf/" in source:
+            result = read_pdf(source, max_chars)
+        else:
+            result = read_basic_url(source, max_chars)
+            result.confidence = score_confidence(result)
+            if auto_upgrade and mode in {"fast", "auto"} and _should_auto_upgrade(result):
+                result = _try_auto_upgrade(
+                    result,
+                    source,
+                    max_chars,
+                    browser_profile,
+                    headless,
+                    interactive_login,
+                    login_timeout_ms,
+                )
 
-    parsed = urllib.parse.urlparse(source)
-    host = parsed.netloc.lower()
-    path = parsed.path.lower()
-    if host in {"github.com", "gist.github.com"}:
-        result = read_github(source, max_chars)
-        return attach_interaction(result, source, read_depth, mode, browser_profile, headless, interactive_login, login_timeout_ms)
-    if "youtube.com" in host or "youtu.be" in host or "bilibili.com" in host:
-        result = read_video(source, max_chars)
-        return attach_interaction(result, source, read_depth, mode, browser_profile, headless, interactive_login, login_timeout_ms)
-    if host in {"news.ycombinator.com", "www.reddit.com", "reddit.com", "v2ex.com", "www.v2ex.com"} or host.endswith(".reddit.com"):
-        result = read_discussion(source, max_chars)
-        return attach_interaction(result, source, read_depth, mode, browser_profile, headless, interactive_login, login_timeout_ms)
-    if path.endswith(".pdf") or "arxiv.org/pdf/" in source:
-        result = read_pdf(source, max_chars)
-        return attach_interaction(result, source, read_depth, mode, browser_profile, headless, interactive_login, login_timeout_ms)
-    result = read_basic_url(source, max_chars)
-    should_try_browser = (
-        result.read_quality == "blocked"
-        or bool(result.metadata.get("maybe_js_rendered"))
+    if history_hit:
+        result.metadata["history_hit"] = history_hit
+    return attach_interaction(
+        result,
+        source,
+        read_depth,
+        mode,
+        browser_profile,
+        headless,
+        interactive_login,
+        login_timeout_ms,
     )
-    if mode == "auto" and should_try_browser and browser_profile:
-        browser_result = read_browser_url(
-            source,
-            max_chars,
-            browser_profile,
-            headless=headless,
-            interactive_login=interactive_login,
-            login_timeout_ms=login_timeout_ms,
-        )
-        browser_result.metadata["fast_reader"] = {
-            "read_quality": result.read_quality,
-            "final_url": result.url,
-            "maybe_js_rendered": result.metadata.get("maybe_js_rendered", False),
-            "errors": result.errors,
-        }
-        return attach_interaction(browser_result, source, read_depth, mode, browser_profile, headless, interactive_login, login_timeout_ms)
-    return attach_interaction(result, source, read_depth, mode, browser_profile, headless, interactive_login, login_timeout_ms)
 
 
 def to_markdown(result: ReaderOutput) -> str:
@@ -1211,6 +1915,7 @@ def to_markdown(result: ReaderOutput) -> str:
 - Fetched: {result.fetched_at}
 - Reader: {result.reader}
 - Read quality: {result.read_quality}
+- Confidence: {result.confidence}
 - Strategy: {result.strategy}
 - Token policy: {result.token_policy}
 - Read depth: {result.read_depth}
@@ -1373,6 +2078,7 @@ def run_action(argv: list[str]) -> int:
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--interactive-login", action="store_true")
     parser.add_argument("--login-timeout-ms", type=int, default=180000)
+    parser.add_argument("--no-auto-upgrade", action="store_true")
     args = parser.parse_args(argv)
 
     read_depth, focus = action_read_depth(args.action_id)
@@ -1387,6 +2093,7 @@ def run_action(argv: list[str]) -> int:
         interactive_login=interactive_login,
         login_timeout_ms=args.login_timeout_ms,
         read_depth=read_depth,
+        auto_upgrade=not args.no_auto_upgrade,
     )
     result.metadata["action_id"] = args.action_id
     result = apply_focus_hint(result, focus)
@@ -1657,10 +2364,13 @@ class SourceReaderHandler(http.server.BaseHTTPRequestHandler):
 
 
 def run_serve(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Run local source-reader HTTP service")
+    parser = argparse.ArgumentParser(description="Run local source-reader HTTP service or stdio MCP server")
+    parser.add_argument("--mcp", action="store_true", help="run the stdio MCP server instead of the HTTP service")
     parser.add_argument("--host", default=DEFAULT_SERVICE_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_SERVICE_PORT)
     args = parser.parse_args(argv)
+    if args.mcp:
+        return run_mcp([])
     if args.host not in {"127.0.0.1", "localhost"}:
         raise SystemExit("source-reader service only supports localhost binding")
     server = SourceReaderHTTPServer((args.host, args.port), SourceReaderHandler)
@@ -1972,6 +2682,10 @@ def main(argv: list[str]) -> int:
         return run_feedback(argv[1:])
     if argv and argv[0] == "review-runs":
         return run_review_runs(argv[1:])
+    if argv and argv[0] == "status":
+        return run_status(argv[1:])
+    if argv and argv[0] == "profile":
+        return run_profile(argv[1:])
     if argv and argv[0] == "serve":
         return run_serve(argv[1:])
     if argv and argv[0] == "remote-read":
@@ -1980,6 +2694,8 @@ def main(argv: list[str]) -> int:
         return run_remote_action(argv[1:])
     if argv and argv[0] == "mcp":
         return run_mcp(argv[1:])
+    if argv and argv[0] == "read":
+        argv = argv[1:]
 
     parser = argparse.ArgumentParser(description="Read one source with a token-aware strategy")
     parser.add_argument("source", nargs="?", help="URL or local file path")
@@ -1992,6 +2708,15 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--headless", action="store_true", help="run browser mode headless")
     parser.add_argument("--interactive-login", action="store_true", help="wait for manual login when browser mode reaches an auth page")
     parser.add_argument("--login-timeout-ms", type=int, default=180000, help="manual login wait timeout in milliseconds")
+    parser.add_argument("--no-auto-upgrade", action="store_true", help="disable automatic browser upgrade when fast read confidence is low")
+    parser.add_argument("--action", help="run a source-reader action on the source (continue_deep_read | extract_outline | extract_code | login_with_browser)")
+    parser.add_argument("--feedback", choices=["good", "bad"], help="record a feedback verdict (requires --run-id)")
+    parser.add_argument("--run-id", default="", help="run id for --feedback")
+    parser.add_argument("--reason", default="", help="reason text for --feedback bad")
+    parser.add_argument("--expected", default="", help="expected outcome for --feedback bad")
+    parser.add_argument("--remote", action="store_true", help="route read/action through the local source-reader service")
+    parser.add_argument("--service-host", default=DEFAULT_SERVICE_HOST, help="source-reader service host for --remote")
+    parser.add_argument("--service-port", type=int, default=DEFAULT_SERVICE_PORT, help="source-reader service port for --remote")
     args = parser.parse_args(argv)
 
     if args.doctor:
@@ -2002,8 +2727,67 @@ def main(argv: list[str]) -> int:
             print(doctor_to_markdown(report))
         return 0 if report.get("status") == "ok" else 1
 
+    if args.feedback:
+        if not args.run_id:
+            parser.error("--feedback requires --run-id")
+        verdict = "mark_good" if args.feedback == "good" else "mark_bad"
+        return run_feedback([verdict, "--run-id", args.run_id, "--reason", args.reason, "--expected", args.expected])
+
     if not args.source:
-        parser.error("source is required unless --doctor is used")
+        parser.error("source is required unless --doctor or --feedback is used")
+
+    profile_for_dispatch = args.browser_profile or ".source-reader/profiles/default"
+
+    if args.action:
+        action_argv = [
+            args.action,
+            "--source", args.source,
+            "--format", args.format,
+            "--mode", args.mode,
+            "--browser-profile", profile_for_dispatch,
+            "--login-timeout-ms", str(args.login_timeout_ms),
+        ]
+        if args.headless:
+            action_argv.append("--headless")
+        if args.interactive_login:
+            action_argv.append("--interactive-login")
+        if args.no_auto_upgrade:
+            action_argv.append("--no-auto-upgrade")
+        if args.remote:
+            action_argv = [
+                args.action,
+                "--source", args.source,
+                "--host", args.service_host,
+                "--port", str(args.service_port),
+                "--format", args.format,
+                "--mode", args.mode,
+                "--browser-profile", profile_for_dispatch,
+                "--login-timeout-ms", str(args.login_timeout_ms),
+            ]
+            if args.headless:
+                action_argv.append("--headless")
+            if args.interactive_login:
+                action_argv.append("--interactive-login")
+            return run_remote_action(action_argv)
+        return run_action(action_argv)
+
+    if args.remote:
+        remote_argv = [
+            args.source,
+            "--host", args.service_host,
+            "--port", str(args.service_port),
+            "--max-chars", str(args.max_chars),
+            "--format", args.format,
+            "--mode", args.mode,
+            "--read-depth", args.read_depth,
+            "--browser-profile", profile_for_dispatch,
+            "--login-timeout-ms", str(args.login_timeout_ms),
+        ]
+        if args.headless:
+            remote_argv.append("--headless")
+        if args.interactive_login:
+            remote_argv.append("--interactive-login")
+        return run_remote_read(remote_argv)
 
     try:
         result = classify_and_read(
@@ -2015,6 +2799,7 @@ def main(argv: list[str]) -> int:
             interactive_login=args.interactive_login,
             login_timeout_ms=args.login_timeout_ms,
             read_depth=args.read_depth,
+            auto_upgrade=not args.no_auto_upgrade,
         )
     except Exception as exc:
         print(f"source-reader failed: {exc}", file=sys.stderr)
@@ -2032,6 +2817,7 @@ def main(argv: list[str]) -> int:
             "headless": args.headless,
             "interactive_login": args.interactive_login,
             "login_timeout_ms": args.login_timeout_ms,
+            "auto_upgrade": not args.no_auto_upgrade,
         },
     )
 

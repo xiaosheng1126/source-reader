@@ -2,9 +2,9 @@
 
 ## 项目定位
 
-`source-reader` 是独立的智能内容读取器，只负责把 URL、本地文件和后续扩展输入读取成 LLM 友好的结构化结果。
+**source-reader 是给 Codex / Claude Code 用的本机阅读层，专读云端 reader 进不来的内容：登录态网站、内网文档、本地文件、付费订阅。**
 
-它不负责个人知识库流程，不决定资料是否沉淀，不写 raw/wiki，不维护用户知识结构。
+它只负责"如何把复杂输入读进来"，不负责知识库流程，不决定资料是否沉淀，不写 raw/wiki，不维护用户知识结构。
 
 ## 目录约定
 
@@ -31,9 +31,10 @@
 python3 -m py_compile scripts/source_reader.py scripts/install.py
 python3 scripts/source_reader.py README.md --read-depth preview --format json
 python3 scripts/source_reader.py --doctor --format md
+python3 scripts/source_reader.py status --format md
 ```
 
-如果修改了 browser 模式，还需要在已安装 Playwright 的环境执行：
+如果修改了 browser 模式，还需要在已装 Playwright 的环境执行：
 
 ```bash
 python3 scripts/source_reader.py <url> --mode browser --browser-profile .source-reader/profiles/default --read-depth preview --format md
