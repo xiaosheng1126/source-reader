@@ -105,6 +105,20 @@ class Installer:
         print("\ninstalling Playwright Chromium (one-time, ~300MB)...")
         subprocess.run(["npx", "playwright", "install", "chromium"], cwd=self.root, check=True)
 
+    def install_scrapling(self) -> None:
+        if self.dry_run:
+            print("\n[dry-run] would install Scrapling + Camoufox (~200MB)")
+            return
+        print("\ninstalling Scrapling fetchers...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "scrapling[fetchers]"], check=True)
+        print("\ninstalling Camoufox browser (one-time, ~200MB)...")
+        subprocess.run(["scrapling", "install"], check=True)
+
+    @staticmethod
+    def scrapling_installed() -> bool:
+        import importlib.util
+        return importlib.util.find_spec("scrapling") is not None
+
     def service_pid_path(self) -> pathlib.Path:
         return self.root / ".source-reader" / "source-reader.pid"
 
@@ -287,6 +301,8 @@ class Installer:
             print(f"Global MCP registered: {', '.join(self.registered_mcp)}")
         else:
             print("Global Codex/Claude MCP registration is intentionally not modified by default.")
+        scrapling_status = "installed" if self.scrapling_installed() else "not installed (run --install-scrapling for anti-bot support)"
+        print(f"Scrapling: {scrapling_status}")
         print(
             "\n[security] .source-reader/profiles/ 含登录态等敏感凭据，"
             "禁止提交 Git、禁止分享项目目录给他人。"
@@ -301,6 +317,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--install-core", action="store_true", help="run npm install for source-reader Node modules (no browser)")
     parser.add_argument("--install-browser", action="store_true", help="install Playwright Chromium (one-time, ~300MB)")
     parser.add_argument("--no-browser", action="store_true", help="skip Playwright Chromium even when --install-mcp implies it")
+    parser.add_argument("--install-scrapling", action="store_true", help="install Scrapling + Camoufox anti-bot fetcher (one-time, ~200MB)")
+    parser.add_argument("--no-scrapling", action="store_true", help="skip Scrapling even when --install-mcp implies it")
     parser.add_argument("--install-runtime", action="store_true", help="DEPRECATED: equivalent to --install-core --install-browser; will be removed")
     parser.add_argument("--start-service", action="store_true", help="start local source-reader service after setup")
     parser.add_argument("--install-mcp", action="store_true", help="write project-local MCP config snippets")
@@ -337,6 +355,8 @@ def main(argv: list[str]) -> int:
     )
     if should_install_browser:
         installer.install_browser()
+    if args.install_scrapling and not args.no_browser:
+        installer.install_scrapling()
     if args.register_mcp != "none":
         installer.register_mcp(args.register_mcp)
     if args.start_service:

@@ -213,6 +213,11 @@ def playwright_installed() -> bool:
     return (ROOT_DIR / "node_modules" / "playwright").exists()
 
 
+def scrapling_installed() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("scrapling") is not None
+
+
 def resolve_browser_profile(browser_profile: str) -> tuple[str, bool, bool]:
     """Return (profile_path_str, exists, used_default).
 
@@ -397,6 +402,21 @@ def build_next_actions(
                 category="setup",
             ),
         )
+    if (
+        result.read_quality in {"blocked", "failed"}
+        and result.metadata.get("auto_upgraded")
+        and not scrapling_installed()
+    ):
+        actions.insert(
+            0,
+            action(
+                "install_scrapling",
+                "安装 Scrapling 反爬层",
+                "安装 Scrapling + Camoufox（约 200MB），可突破 Cloudflare 等反爬保护，作为 browser 模式后的最后一道。",
+                command="python3 scripts/install.py --install-scrapling",
+                category="setup",
+            ),
+        )
     if result.read_quality in {"blocked", "failed"}:
         actions.insert(
             0,
@@ -489,6 +509,7 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
             cwd=ROOT_DIR,
         )
 
+    scrapling_ok = scrapling_installed()
     checks = {
         "root": str(ROOT_DIR),
         "node": node_ok,
@@ -496,6 +517,7 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
         "package_json": package_json.exists(),
         "browser_reader": browser_reader.exists(),
         "playwright": playwright_ok,
+        "scrapling": scrapling_ok,
         "browser_profile": profile_path.exists(),
         "browser_profile_path": str(profile_path),
     }
@@ -507,6 +529,10 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
     if not playwright_ok:
         recommendations.append(
             "Browser mode requires Playwright. Run: python3 scripts/install.py --install-browser"
+        )
+    if not scrapling_ok:
+        recommendations.append(
+            "Scrapling (anti-bot tier) is optional. Run: python3 scripts/install.py --install-scrapling (~200MB, Camoufox)"
         )
     if not profile_path.exists():
         recommendations.append(f"Create browser profile directory: {profile_path}")
@@ -1119,8 +1145,30 @@ def looks_like_js_shell(decoded: str, content: str) -> bool:
     return False
 
 
+def looks_like_cloudflare_block(content: str) -> bool:
+    text = content.lower()
+    markers = ("cloudflare", "cf-ray", "just a moment", "challenge-platform", "checking if the site connection")
+    return sum(1 for m in markers if m in text) >= 2
+
+
 def read_basic_url(url: str, max_chars: int) -> ReaderOutput:
-    body, content_type, final_url = request_url(url)
+    try:
+        body, content_type, final_url = request_url(url)
+    except RuntimeError as exc:
+        err_str = str(exc)
+        http_blocked = any(code in err_str for code in ("403", "429", "503", "Forbidden", "Too Many Requests"))
+        return ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title=url,
+            url=url,
+            read_quality="blocked" if http_blocked else "failed",
+            strategy="html_text_extraction",
+            token_policy=token_policy(max_chars, False),
+            content="",
+            metadata={"blocked_by": "http_error", "requested_url": url},
+            errors=[f"HTTP request failed: {err_str}"],
+        )
     decoded = decode_body(body, content_type)
     is_html = "html" in content_type or decoded.lstrip().startswith("<")
     if is_html:
@@ -1246,6 +1294,69 @@ def read_browser_url(
         content=str(payload.get("content") or ""),
         metadata=dict(payload.get("metadata") or {}),
         errors=list(payload.get("errors") or []),
+    )
+
+
+def read_scrapling_url(url: str, max_chars: int) -> ReaderOutput:
+    try:
+        from scrapling.fetchers import StealthyFetcher  # type: ignore[import]
+    except ImportError:
+        return ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title=url,
+            url=url,
+            read_quality="failed",
+            strategy="scrapling_stealthy_fetcher",
+            token_policy=token_policy(max_chars, False),
+            content="",
+            errors=["Scrapling 未安装。运行: python3 scripts/install.py --install-scrapling"],
+        )
+    errors: list[str] = []
+    try:
+        page = StealthyFetcher.fetch(url, headless=True, network_idle=True)
+    except Exception as exc:
+        return ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title=url,
+            url=url,
+            read_quality="failed",
+            strategy="scrapling_stealthy_fetcher",
+            token_policy=token_policy(max_chars, False),
+            content="",
+            errors=[f"Scrapling StealthyFetcher 失败: {exc}"],
+        )
+    title = ""
+    try:
+        title_el = page.find("title")
+        title = str(title_el.text).strip() if title_el and hasattr(title_el, "text") else ""
+    except Exception:
+        pass
+    try:
+        content_text = page.get_all_text(ignore_tags=("script", "style", "head", "noscript"))
+    except TypeError:
+        try:
+            content_text = str(page.get_all_text())
+        except Exception as exc2:
+            content_text = ""
+            errors.append(f"文本提取警告: {exc2}")
+    except Exception as exc:
+        content_text = ""
+        errors.append(f"文本提取失败: {exc}")
+    content, clipped = cap_text(content_text or "", max_chars)
+    read_quality = "basic" if content and len(content.strip()) > 200 else "partial"
+    return ReaderOutput(
+        input_type="url",
+        source_type="webpage",
+        title=title or url,
+        url=url,
+        read_quality=read_quality,
+        strategy="scrapling_stealthy_fetcher",
+        token_policy=token_policy(max_chars, clipped),
+        content=content or "Scrapling 读取结果为空。",
+        metadata={"scrapling_mode": "StealthyFetcher"},
+        errors=errors,
     )
 
 
@@ -1675,6 +1786,25 @@ def _try_auto_upgrade(
     browser_result.metadata["auto_upgrade_reason"] = _auto_upgrade_reason(result)
     if used_default:
         browser_result.metadata["browser_profile_default"] = True
+
+    # Third tier: scrapling StealthyFetcher when browser also fails (e.g. Cloudflare)
+    should_try_scrapling = (
+        browser_result.read_quality in {"failed", "blocked"}
+        or looks_like_cloudflare_block(browser_result.content)
+    )
+    if should_try_scrapling and scrapling_installed():
+        scrapling_result = read_scrapling_url(source, max_chars)
+        scrapling_conf = score_confidence(scrapling_result)
+        browser_conf = score_confidence(browser_result)
+        if scrapling_conf > browser_conf or browser_result.read_quality in {"failed", "blocked"}:
+            scrapling_result.metadata["prev_readers"] = {
+                "fast": {"read_quality": result.read_quality, "confidence": result.confidence},
+                "browser": {"read_quality": browser_result.read_quality, "confidence": browser_conf},
+            }
+            scrapling_result.metadata["auto_upgraded"] = True
+            scrapling_result.metadata["auto_upgrade_reason"] = "scrapling_anti_bot"
+            return scrapling_result
+
     return browser_result
 
 
@@ -1715,6 +1845,8 @@ def classify_and_read(
                 interactive_login=interactive_login,
                 login_timeout_ms=login_timeout_ms,
             )
+    elif mode == "scrapling":
+        result = read_scrapling_url(source, max_chars)
     else:
         parsed = urllib.parse.urlparse(source)
         host = parsed.netloc.lower()
@@ -1942,7 +2074,7 @@ def run_action(argv: list[str]) -> int:
     parser.add_argument("action_id", help="action id from Source Reader output")
     parser.add_argument("--source", required=True, help="URL or local file path")
     parser.add_argument("--format", choices=["json", "md"], default="md")
-    parser.add_argument("--mode", choices=["fast", "browser", "auto"], default="auto")
+    parser.add_argument("--mode", choices=["fast", "browser", "auto", "scrapling"], default="auto")
     parser.add_argument("--browser-profile", default=".source-reader/profiles/default")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--interactive-login", action="store_true")
@@ -2260,7 +2392,7 @@ def run_remote_read(argv: list[str]) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_SERVICE_PORT)
     parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
     parser.add_argument("--format", choices=["json", "md"], default="md")
-    parser.add_argument("--mode", choices=["fast", "browser", "auto"], default="auto")
+    parser.add_argument("--mode", choices=["fast", "browser", "auto", "scrapling"], default="auto")
     parser.add_argument("--read-depth", choices=["preview", "standard", "full"], default="preview")
     parser.add_argument("--browser-profile", default=".source-reader/profiles/default")
     parser.add_argument("--headless", action="store_true")
@@ -2403,7 +2535,7 @@ def mcp_tool_schema() -> list[dict[str, object]]:
                 "properties": {
                     "source": {"type": "string"},
                     "read_depth": {"type": "string", "enum": ["preview", "standard", "full"], "default": "preview"},
-                    "mode": {"type": "string", "enum": ["fast", "browser", "auto"], "default": "auto"},
+                    "mode": {"type": "string", "enum": ["fast", "browser", "auto", "scrapling"], "default": "auto"},
                     "format": {"type": "string", "enum": ["md", "json"], "default": "md"},
                 },
                 "required": ["source"],
@@ -2571,7 +2703,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--doctor", action="store_true", help="check source-reader browser/runtime setup")
     parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS, help="maximum content characters to return")
     parser.add_argument("--format", choices=["json", "md"], default="md", help="output format")
-    parser.add_argument("--mode", choices=["fast", "browser", "auto"], default="fast", help="read strategy mode")
+    parser.add_argument("--mode", choices=["fast", "browser", "auto", "scrapling"], default="fast", help="read strategy mode")
     parser.add_argument("--read-depth", choices=["preview", "standard", "full"], default="standard", help="reading budget and interaction depth")
     parser.add_argument("--browser-profile", default="", help="persistent browser profile directory for browser/auto mode")
     parser.add_argument("--headless", action="store_true", help="run browser mode headless")
