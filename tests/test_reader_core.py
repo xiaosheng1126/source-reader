@@ -134,6 +134,29 @@ class ActionPolicyTests(unittest.TestCase):
     def test_basic_result_does_not_need_auth_action(self) -> None:
         self.assertFalse(needs_auth_assistance(ResultStub("basic")))
 
+    def test_missing_yt_dlp_adds_install_action(self) -> None:
+        result = source_reader.ReaderOutput(
+            input_type="url",
+            source_type="video",
+            title="https://youtube.com/watch?v=x",
+            read_quality="partial",
+            strategy="video_metadata_stub_no_yt_dlp",
+            token_policy="max_chars=6000; full_within_budget",
+            content="",
+            errors=["yt-dlp not found"],
+        )
+        actions = source_reader.build_next_actions(
+            result,
+            "https://youtube.com/watch?v=x",
+            "fast",
+            ".source-reader/profiles/default",
+            False,
+            False,
+            180000,
+        )
+        self.assertEqual(actions[0]["id"], "install_yt_dlp")
+        self.assertEqual(actions[0]["command"], "python3 scripts/install.py --install-yt-dlp")
+
 
 class FailureLogTests(unittest.TestCase):
     def test_failed_result_writes_failure_log(self) -> None:

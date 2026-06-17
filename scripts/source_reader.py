@@ -41,6 +41,7 @@ DEFAULT_SERVICE_PORT = 8765
 SERVICE_PID_PATH = ROOT_DIR / ".source-reader" / "source-reader.pid"
 SERVICE_RUNTIME_PATH = ROOT_DIR / ".source-reader" / "mcp" / "source-reader.runtime.json"
 FAILURES_DIR = ROOT_DIR / ".source-reader" / "failures"
+VENDOR_DIR = ROOT_DIR / ".source-reader" / "vendor"
 PROFILE_WARN_DAYS = 14
 PROFILE_CRITICAL_DAYS = 30
 CREDENTIAL_WARNING = (
@@ -230,6 +231,53 @@ def scrapling_installed() -> bool:
     return importlib.util.find_spec("scrapling") is not None
 
 
+def yt_dlp_vendor_python_installed() -> bool:
+    return (VENDOR_DIR / "yt_dlp").exists()
+
+
+def yt_dlp_vendor_bin() -> pathlib.Path:
+    suffix = ".exe" if os.name == "nt" else ""
+    return VENDOR_DIR / "bin" / f"yt-dlp{suffix}"
+
+
+def yt_dlp_env() -> dict[str, str]:
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(VENDOR_DIR) if not existing else f"{VENDOR_DIR}{os.pathsep}{existing}"
+    return env
+
+
+def resolve_yt_dlp_command() -> tuple[list[str], dict[str, str] | None, str] | None:
+    local_bin = yt_dlp_vendor_bin()
+    if local_bin.exists():
+        return [str(local_bin)], None, "project_vendor_bin"
+    if yt_dlp_vendor_python_installed():
+        return [sys.executable, "-m", "yt_dlp"], yt_dlp_env(), "project_vendor_python"
+    if command_exists("yt-dlp"):
+        return ["yt-dlp"], None, "path"
+    return None
+
+
+def yt_dlp_status() -> dict[str, object]:
+    resolved = resolve_yt_dlp_command()
+    if not resolved:
+        return {
+            "installed": False,
+            "source": "missing",
+            "version": None,
+            "vendor_dir": str(VENDOR_DIR),
+        }
+    command, env, source = resolved
+    ok, output = run_check(command + ["--version"], cwd=ROOT_DIR, env=env)
+    return {
+        "installed": ok,
+        "source": source,
+        "version": output if ok else None,
+        "vendor_dir": str(VENDOR_DIR),
+        "message": "" if ok else output,
+    }
+
+
 def resolve_browser_profile(browser_profile: str) -> tuple[str, bool, bool]:
     """Return (profile_path_str, exists, used_default).
 
@@ -414,6 +462,17 @@ def build_next_actions(
                 category="setup",
             ),
         )
+    if any("yt-dlp not found" in error for error in result.errors):
+        actions.insert(
+            0,
+            action(
+                "install_yt_dlp",
+                "安装 yt-dlp",
+                "安装项目本地 yt-dlp 到 .source-reader/vendor，用于读取 YouTube 等视频字幕，不修改系统 PATH。",
+                command="python3 scripts/install.py --install-yt-dlp",
+                category="setup",
+            ),
+        )
     if (
         result.read_quality in {"blocked", "failed"}
         and result.metadata.get("auto_upgraded")
@@ -495,9 +554,13 @@ def command_exists(command: str) -> bool:
     return proc.returncode == 0
 
 
-def run_check(command: list[str], cwd: pathlib.Path | None = None) -> tuple[bool, str]:
+def run_check(
+    command: list[str],
+    cwd: pathlib.Path | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[bool, str]:
     try:
-        proc = subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False, timeout=20)
+        proc = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, check=False, timeout=20)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     output = (proc.stdout.strip() or proc.stderr.strip())
@@ -522,6 +585,7 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
         )
 
     scrapling_ok = scrapling_installed()
+    yt_dlp = yt_dlp_status()
     checks = {
         "root": str(ROOT_DIR),
         "node": node_ok,
@@ -529,6 +593,7 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
         "package_json": package_json.exists(),
         "browser_reader": browser_reader.exists(),
         "playwright": playwright_ok,
+        "yt_dlp": yt_dlp,
         "scrapling": scrapling_ok,
         "browser_profile": profile_path.exists(),
         "browser_profile_path": str(profile_path),
@@ -541,6 +606,10 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
     if not playwright_ok:
         recommendations.append(
             "Browser mode requires Playwright. Run: python3 scripts/install.py --install-browser"
+        )
+    if not yt_dlp.get("installed"):
+        recommendations.append(
+            "Video transcript reading requires yt-dlp. Run: python3 scripts/install.py --install-yt-dlp"
         )
     if not scrapling_ok:
         recommendations.append(
@@ -938,6 +1007,7 @@ def gather_status(recent_limit: int = 10) -> dict[str, object]:
         "recent_reads": recent_reads_from_runs(recent_limit),
         "recent_failures": recent_failures_from_logs(recent_limit),
         "playwright": playwright_status(),
+        "yt_dlp": yt_dlp_status(),
         "runtime": runtime_status(),
     }
 
@@ -946,6 +1016,7 @@ def status_to_markdown(report: dict[str, object]) -> str:
     service = report.get("service") if isinstance(report.get("service"), dict) else {}
     profile = report.get("profile") if isinstance(report.get("profile"), dict) else {}
     playwright = report.get("playwright") if isinstance(report.get("playwright"), dict) else {}
+    yt_dlp = report.get("yt_dlp") if isinstance(report.get("yt_dlp"), dict) else {}
     runtime = report.get("runtime") if isinstance(report.get("runtime"), dict) else {}
     recent = report.get("recent_reads") if isinstance(report.get("recent_reads"), list) else []
     recent_failures = report.get("recent_failures") if isinstance(report.get("recent_failures"), list) else []
@@ -1045,6 +1116,13 @@ def status_to_markdown(report: dict[str, object]) -> str:
 
 - Installed: {playwright.get('installed')}
 - Version: {playwright.get('version') or 'n/a'}
+
+## yt-dlp
+
+- Installed: {yt_dlp.get('installed')}
+- Source: {yt_dlp.get('source') or 'n/a'}
+- Version: {yt_dlp.get('version') or 'n/a'}
+- Vendor dir: {yt_dlp.get('vendor_dir') or 'n/a'}
 
 ## Runtime
 
@@ -1623,16 +1701,9 @@ def read_github(url: str, max_chars: int) -> ReaderOutput:
     return read_github_repo_readme(owner, repo, url, max_chars)
 
 
-def command_exists(command: str) -> bool:
-    try:
-        subprocess.run([command, "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return True
-
-
 def read_video(url: str, max_chars: int) -> ReaderOutput:
-    if not command_exists("yt-dlp"):
+    resolved = resolve_yt_dlp_command()
+    if not resolved:
         return ReaderOutput(
             input_type="url",
             source_type="video",
@@ -1646,9 +1717,10 @@ def read_video(url: str, max_chars: int) -> ReaderOutput:
         )
 
     with tempfile.TemporaryDirectory() as tmp:
+        yt_dlp_cmd, yt_dlp_run_env, yt_dlp_source = resolved
         output_tpl = str(pathlib.Path(tmp) / "subtitle.%(ext)s")
         cmd = [
-            "yt-dlp",
+            *yt_dlp_cmd,
             "--skip-download",
             "--write-auto-subs",
             "--write-subs",
@@ -1662,7 +1734,7 @@ def read_video(url: str, max_chars: int) -> ReaderOutput:
             "title",
             url,
         ]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=yt_dlp_run_env, text=True, timeout=90)
         title = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else url
         subtitle_files = sorted(pathlib.Path(tmp).glob("*.vtt"))
         if not subtitle_files:
@@ -1675,6 +1747,7 @@ def read_video(url: str, max_chars: int) -> ReaderOutput:
                 strategy="video_subtitle_attempt",
                 token_policy=token_policy(max_chars, False),
                 content="没有找到可用字幕。不要读取整段音视频；下一步应人工提供字幕或开启转写。",
+                metadata={"yt_dlp_source": yt_dlp_source},
                 errors=[proc.stderr.strip()[-1000:] if proc.stderr else "subtitle not found"],
             )
         text = vtt_to_text(subtitle_files[0].read_text(encoding="utf-8", errors="replace"))
@@ -1688,7 +1761,7 @@ def read_video(url: str, max_chars: int) -> ReaderOutput:
             strategy="video_subtitles_only",
             token_policy=token_policy(max_chars, clipped),
             content=content,
-            metadata={"subtitle_file": subtitle_files[0].name},
+            metadata={"subtitle_file": subtitle_files[0].name, "yt_dlp_source": yt_dlp_source},
         )
 
 

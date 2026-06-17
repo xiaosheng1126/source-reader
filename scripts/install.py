@@ -114,10 +114,34 @@ class Installer:
         print("\ninstalling Camoufox browser (one-time, ~200MB)...")
         subprocess.run(["scrapling", "install"], check=True)
 
+    def install_yt_dlp(self) -> None:
+        vendor_dir = self.root / ".source-reader" / "vendor"
+        if self.dry_run:
+            print(f"\n[dry-run] would install yt-dlp into {vendor_dir.relative_to(self.root)}")
+            return
+        vendor_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\ninstalling yt-dlp into {vendor_dir.relative_to(self.root)}...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--target", str(vendor_dir), "yt-dlp"],
+            cwd=self.root,
+            check=True,
+        )
+
     @staticmethod
     def scrapling_installed() -> bool:
         import importlib.util
         return importlib.util.find_spec("scrapling") is not None
+
+    def yt_dlp_status(self) -> str:
+        local_package = self.root / ".source-reader" / "vendor" / "yt_dlp"
+        local_bin = self.root / ".source-reader" / "vendor" / "bin" / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp")
+        if local_bin.exists():
+            return f"installed (project vendor bin: {local_bin.relative_to(self.root)})"
+        if local_package.exists():
+            return f"installed (project vendor python package: {local_package.relative_to(self.root)})"
+        if shutil.which("yt-dlp"):
+            return "installed (PATH)"
+        return "not installed (run --install-yt-dlp for video transcripts)"
 
     def service_pid_path(self) -> pathlib.Path:
         return self.root / ".source-reader" / "source-reader.pid"
@@ -303,6 +327,7 @@ class Installer:
             print("Global Codex/Claude MCP registration is intentionally not modified by default.")
         scrapling_status = "installed" if self.scrapling_installed() else "not installed (run --install-scrapling for anti-bot support)"
         print(f"Scrapling: {scrapling_status}")
+        print(f"yt-dlp: {self.yt_dlp_status()}")
         print(
             "\n[security] .source-reader/profiles/ 含登录态等敏感凭据，"
             "禁止提交 Git、禁止分享项目目录给他人。"
@@ -319,6 +344,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--no-browser", action="store_true", help="skip Playwright Chromium even when --install-mcp implies it")
     parser.add_argument("--install-scrapling", action="store_true", help="install Scrapling + Camoufox anti-bot fetcher (one-time, ~200MB)")
     parser.add_argument("--no-scrapling", action="store_true", help="skip Scrapling even when --install-mcp implies it")
+    parser.add_argument("--install-yt-dlp", action="store_true", help="install project-local yt-dlp into .source-reader/vendor for video subtitles")
     parser.add_argument("--install-runtime", action="store_true", help="DEPRECATED: equivalent to --install-core --install-browser; will be removed")
     parser.add_argument("--start-service", action="store_true", help="start local source-reader service after setup")
     parser.add_argument("--install-mcp", action="store_true", help="write project-local MCP config snippets")
@@ -357,6 +383,8 @@ def main(argv: list[str]) -> int:
         installer.install_browser()
     if args.install_scrapling and not args.no_browser:
         installer.install_scrapling()
+    if args.install_yt_dlp:
+        installer.install_yt_dlp()
     if args.register_mcp != "none":
         installer.register_mcp(args.register_mcp)
     if args.start_service:
