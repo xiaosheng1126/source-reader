@@ -15,7 +15,6 @@ from reader_core.detectors import (
     looks_like_cloudflare_block,
     looks_like_js_shell,
 )
-from reader_core.models import ReaderOutput as _ReaderOutputFromModels
 import source_reader
 
 
@@ -197,8 +196,8 @@ class ModelsTests(unittest.TestCase):
         self.assertEqual(r.errors, [])
 
     def test_source_reader_still_exposes_reader_output(self) -> None:
-        r = source_reader.ReaderOutput(input_type="url", source_type="webpage", title="test")
-        self.assertIsInstance(r, source_reader.ReaderOutput)
+        from reader_core.models import ReaderOutput as _ModelsCls
+        self.assertIs(source_reader.ReaderOutput, _ModelsCls)
 
 
 if __name__ == "__main__":
