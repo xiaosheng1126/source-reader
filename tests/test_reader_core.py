@@ -15,6 +15,7 @@ from reader_core.detectors import (
     looks_like_cloudflare_block,
     looks_like_js_shell,
 )
+from reader_core.models import ReaderOutput as _ReaderOutputFromModels
 import source_reader
 
 
@@ -185,6 +186,19 @@ class FailureLogTests(unittest.TestCase):
             finally:
                 source_reader.RUNS_DIR = original_runs_dir
                 source_reader.FAILURES_DIR = original_failures_dir
+
+
+class ModelsTests(unittest.TestCase):
+    def test_reader_output_importable_from_models(self) -> None:
+        from reader_core.models import ReaderOutput
+        r = ReaderOutput(input_type="url", source_type="webpage", title="test")
+        self.assertEqual(r.read_quality, "basic")
+        self.assertEqual(r.confidence, 0)
+        self.assertEqual(r.errors, [])
+
+    def test_source_reader_still_exposes_reader_output(self) -> None:
+        r = source_reader.ReaderOutput(input_type="url", source_type="webpage", title="test")
+        self.assertIsInstance(r, source_reader.ReaderOutput)
 
 
 if __name__ == "__main__":
