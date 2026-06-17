@@ -10,10 +10,13 @@
 
 - `scripts/source_reader.py`：Python CLI、HTTP service、MCP server、读取策略入口。
 - `scripts/browser_reader.mjs`：Playwright 持久化 profile 网页读取器。
+- `reader_core/`：Python 读取策略核心，放通用模型、限制检测、质量判断、action 生成等可测试逻辑。
+- `site_rules/`：站点级规则，按域名封装受限视图识别、目标内容判断和后续动作建议。
 - `scripts/install.py`：本地运行时、MCP wrapper、Codex/Claude 注册安装器。
 - `adapters/`：面向不同 Agent 的接入说明和 skill/command 模板。
 - `docs/`：输入类型、策略设计和后续规划。
-- `.source-reader/`：运行时目录，只存 profile、run log、pid、log、MCP 生成文件，不提交 Git。
+- `tests/`：轻量回归测试，优先覆盖无网络、无浏览器依赖的策略和检测逻辑。
+- `.source-reader/`：运行时目录，只存 profile、run log、failure log、pid、log、MCP 生成文件，不提交 Git。
 
 ## 开发约束
 
@@ -32,6 +35,7 @@ python3 -m py_compile scripts/source_reader.py scripts/install.py
 python3 scripts/source_reader.py README.md --read-depth preview --format json
 python3 scripts/source_reader.py --doctor --format md
 python3 scripts/source_reader.py status --format md
+python3 -m unittest discover -s tests
 ```
 
 如果修改了 browser 模式，还需要在已装 Playwright 的环境执行：

@@ -27,4 +27,6 @@ Rules:
 
 - Start with `preview` for unknown or large sources.
 - Fast mode auto-upgrades to browser when confidence < 40, login wall, or JS shell — no need to retry by hand.
+- Before running `login_with_browser` or any `category=auth` action, ask the user whether they want to assist with login.
+- Auth actions use `.source-reader/profiles/default`; never ask for, print, or handle passwords, verification codes, cookies, or tokens.
 - source-reader does not write to any knowledge base. It only returns readable source content and operation suggestions.

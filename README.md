@@ -15,6 +15,7 @@
 - JS 渲染网页：用 Playwright 持久化 profile 渲染后读取正文。
 - 登录态网页：用 Playwright 持久化 profile 保存登录态后读取。
 - GitHub：repo、gist、issue、PR、release note、raw 文件。
+- 中文技术社区：掘金登录/受限视图识别。
 - PDF/论文：arXiv PDF 优先读取摘要页；普通 PDF 先标记为待增强。
 - 视频字幕：YouTube、B站。
 - 讨论串：HN、Reddit、V2EX、X thread。
@@ -179,6 +180,14 @@ python3 scripts/source_reader.py read <source> --remote --action continue_deep_r
 ```
 
 run log 只用于复盘工具表现，不进入任何知识库。它记录输入、读取策略、读取质量、token 估算、actions 和用户反馈。
+
+当读取结果为 `failed` / `blocked` / `partial`，或结果中包含 `errors` 时，会额外写入失败样本：
+
+```text
+.source-reader/failures/<run_id>.json
+```
+
+failure log 保存本次调用参数、读取质量、策略、结构化 metadata、错误和正文前 2000 字符，用于后续定期复盘站点规则、登录态判断和降级策略。该目录同样属于本机运行时数据，不提交 Git。
 
 反馈命令：
 

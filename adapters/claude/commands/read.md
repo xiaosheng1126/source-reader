@@ -14,7 +14,7 @@ If the local service is unavailable:
 python3 scripts/source_reader.py read "$ARGUMENTS" --read-depth preview --format md
 ```
 
-If login is required:
+If login is required, ask the user whether they want to assist with login first. After confirmation:
 
 ```bash
 python3 scripts/source_reader.py read "$ARGUMENTS" --remote --action login_with_browser --format md

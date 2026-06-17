@@ -18,7 +18,7 @@ python3 scripts/source_reader.py read <source> --read-depth preview --format md
 
    Fast mode auto-upgrades to browser when confidence < 40, login wall, or JS shell — no need to retry by hand.
 
-3. If the output still says login is required, run the reader action:
+3. If the output exposes `login_with_browser`, `category=auth`, or says login/authorization is required, ask the user whether they want to assist with login before running the action. After confirmation, run:
 
 ```bash
 python3 scripts/source_reader.py read <source> --remote --action login_with_browser --format md
@@ -44,3 +44,4 @@ python3 scripts/source_reader.py status --format md
 - Do not treat it as a knowledge-base workflow.
 - Do not write raw/wiki or modify user knowledge notes from this skill.
 - For large sources, start with `--read-depth preview` and ask before deep reading.
+- Auth actions use `.source-reader/profiles/default`; do not ask for, print, or handle passwords, verification codes, cookies, or tokens.

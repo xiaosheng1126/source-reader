@@ -65,14 +65,46 @@ function capText(text, maxChars) {
   };
 }
 
-function looksLikeAuthWall(url, title, text) {
+function detectAccessLimitation(url, title, text) {
   const parsed = new URL(url);
   const joined = `${title}\n${text}`.toLowerCase();
   const loginWords = ["login", "signin", "sign in", "登录", "登陆", "授权", "认证"];
   if (["/login", "/signin", "/passport"].some((part) => parsed.pathname.toLowerCase().includes(part))) {
-    return true;
+    return { blocked: true, reason: "auth_wall" };
   }
-  return text.length < 500 && loginWords.some((word) => joined.includes(word));
+  if (text.length < 500 && loginWords.some((word) => joined.includes(word))) {
+    return { blocked: true, reason: "auth_wall" };
+  }
+  if (["x.com", "twitter.com"].includes(parsed.hostname.replace(/^www\./, ""))) {
+    const loggedOutMarkers = [
+      "new to x?",
+      "sign up now",
+      "don't miss what's happening",
+      "log in",
+      "sign up",
+    ];
+    const hasLoggedOutChrome = loggedOutMarkers.filter((marker) => joined.includes(marker)).length >= 2;
+    const profileContradiction = /\b[\d,.]+\s*posts\b/i.test(text) && /hasn.?t posted/i.test(text);
+    if (hasLoggedOutChrome || profileContradiction) {
+      return { blocked: true, reason: "limited_logged_out_view" };
+    }
+  }
+  if (["juejin.cn", "juejin.im"].includes(parsed.hostname.replace(/^www\./, ""))) {
+    const strongAuthMarkers = [
+      "登录后查看",
+      "请登录后",
+      "登录后才能",
+      "登录掘金",
+      "扫码登录",
+      "验证码登录",
+      "第三方账号登录",
+      "账号密码登录",
+    ];
+    if (strongAuthMarkers.some((marker) => joined.includes(marker))) {
+      return { blocked: true, reason: "auth_wall" };
+    }
+  }
+  return { blocked: false, reason: "" };
 }
 
 async function importPlaywright() {
@@ -134,11 +166,12 @@ async function extractPage(page, maxChars) {
 
   const chosenText = payload.candidateText || payload.bodyText || "";
   const capped = capText(chosenText, maxChars);
-  const authWall = looksLikeAuthWall(payload.url, payload.title, capped.text);
+  const access = detectAccessLimitation(payload.url, payload.title, capped.text);
   return {
     payload,
     capped,
-    authWall,
+    authWall: access.blocked,
+    accessReason: access.reason,
   };
 }
 
@@ -164,7 +197,7 @@ async function main() {
     await page.goto(args.url, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForTimeout(args.waitMs);
 
-    let { payload, capped, authWall } = await extractPage(page, args.maxChars);
+    let { payload, capped, authWall, accessReason } = await extractPage(page, args.maxChars);
     let loginWaited = false;
     if (authWall && args.interactiveLogin && !args.headless) {
       loginWaited = true;
@@ -175,6 +208,7 @@ async function main() {
         payload = extracted.payload;
         capped = extracted.capped;
         authWall = extracted.authWall;
+        accessReason = extracted.accessReason;
         if (!authWall) {
           break;
         }
@@ -195,6 +229,8 @@ async function main() {
         body_length: payload.bodyText.length,
         interactive_login: args.interactiveLogin,
         login_waited: loginWaited,
+        blocked_by: authWall ? accessReason : "",
+        auth_assistance_reason: authWall ? accessReason : "",
       },
       errors: authWall ? ["Page still appears to require login or authorization in the browser profile. Open the profile once and log in."] : [],
     };

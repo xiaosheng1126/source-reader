@@ -40,6 +40,7 @@ DEFAULT_SERVICE_HOST = "127.0.0.1"
 DEFAULT_SERVICE_PORT = 8765
 SERVICE_PID_PATH = ROOT_DIR / ".source-reader" / "source-reader.pid"
 SERVICE_RUNTIME_PATH = ROOT_DIR / ".source-reader" / "mcp" / "source-reader.runtime.json"
+FAILURES_DIR = ROOT_DIR / ".source-reader" / "failures"
 PROFILE_WARN_DAYS = 14
 PROFILE_CRITICAL_DAYS = 30
 CREDENTIAL_WARNING = (
@@ -49,6 +50,17 @@ CREDENTIAL_WARNING = (
 
 CONFIDENCE_UPGRADE_THRESHOLD = 40
 DEFAULT_BROWSER_PROFILE = ".source-reader/profiles/default"
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from reader_core.actions import needs_auth_assistance
+from reader_core.detectors import (  # noqa: E402
+    detect_access_limitation,
+    looks_like_auth_wall,
+    looks_like_cloudflare_block,
+    looks_like_js_shell,
+)
 
 
 @dataclasses.dataclass
@@ -417,7 +429,7 @@ def build_next_actions(
                 category="setup",
             ),
         )
-    if result.read_quality in {"blocked", "failed"}:
+    if needs_auth_assistance(result):
         actions.insert(
             0,
             action(
@@ -549,6 +561,43 @@ def run_log_path(run_id: str) -> pathlib.Path:
     return RUNS_DIR / f"{run_id}.json"
 
 
+def failure_log_path(run_id: str) -> pathlib.Path:
+    return FAILURES_DIR / f"{run_id}.json"
+
+
+def display_path(path: pathlib.Path) -> str:
+    try:
+        return str(path.relative_to(ROOT_DIR))
+    except ValueError:
+        return str(path)
+
+
+def should_persist_failure_log(result: ReaderOutput) -> bool:
+    return result.read_quality in {"blocked", "failed", "partial"} or bool(result.errors)
+
+
+def persist_failure_log(result: ReaderOutput, source: str, invocation: dict[str, object]) -> pathlib.Path | None:
+    if not should_persist_failure_log(result):
+        return None
+    FAILURES_DIR.mkdir(parents=True, exist_ok=True)
+    path = failure_log_path(result.run_id)
+    result.metadata["failure_log_path"] = display_path(path)
+    payload = {
+        "run_id": result.run_id,
+        "source": source,
+        "invocation": invocation,
+        "recorded_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "read_quality": result.read_quality,
+        "confidence": result.confidence,
+        "strategy": result.strategy,
+        "metadata": result.metadata,
+        "errors": result.errors,
+        "content_excerpt": (result.content or "")[:2000],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def recent_reads_from_runs(limit: int = 10) -> list[dict[str, object]]:
     """Return the N most recent run logs as summary dicts, ordered newest first.
 
@@ -588,10 +637,42 @@ def recent_reads_from_runs(limit: int = 10) -> list[dict[str, object]]:
     return output
 
 
+def recent_failures_from_logs(limit: int = 10) -> list[dict[str, object]]:
+    if not FAILURES_DIR.exists() or limit <= 0:
+        return []
+    files = sorted(FAILURES_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    output: list[dict[str, object]] = []
+    for path in files:
+        if len(output) >= limit:
+            break
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        output.append(
+            {
+                "run_id": payload.get("run_id"),
+                "source": payload.get("source"),
+                "read_quality": payload.get("read_quality"),
+                "confidence": int(payload.get("confidence") or 0),
+                "strategy": payload.get("strategy"),
+                "blocked_by": metadata.get("blocked_by"),
+                "auth_assistance_reason": metadata.get("auth_assistance_reason"),
+                "errors": payload.get("errors") or [],
+                "failure_log_path": display_path(path),
+            }
+        )
+    return output
+
+
 def persist_run_log(result: ReaderOutput, source: str, invocation: dict[str, object]) -> pathlib.Path:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     path = run_log_path(result.run_id)
-    result.metadata["run_log_path"] = str(path.relative_to(ROOT_DIR))
+    persist_failure_log(result, source, invocation)
+    result.metadata["run_log_path"] = display_path(path)
     payload = {
         "run_id": result.run_id,
         "source": source,
@@ -855,6 +936,7 @@ def gather_status(recent_limit: int = 10) -> dict[str, object]:
         "service": service_status(),
         "profile": profile_status(),
         "recent_reads": recent_reads_from_runs(recent_limit),
+        "recent_failures": recent_failures_from_logs(recent_limit),
         "playwright": playwright_status(),
         "runtime": runtime_status(),
     }
@@ -866,6 +948,7 @@ def status_to_markdown(report: dict[str, object]) -> str:
     playwright = report.get("playwright") if isinstance(report.get("playwright"), dict) else {}
     runtime = report.get("runtime") if isinstance(report.get("runtime"), dict) else {}
     recent = report.get("recent_reads") if isinstance(report.get("recent_reads"), list) else []
+    recent_failures = report.get("recent_failures") if isinstance(report.get("recent_failures"), list) else []
 
     if service.get("running"):
         uptime = service.get("uptime_seconds") or 0
@@ -908,6 +991,28 @@ def status_to_markdown(report: dict[str, object]) -> str:
     else:
         recent_block = "- (none)"
 
+    if recent_failures:
+        failure_lines: list[str] = []
+        for item in recent_failures:
+            if not isinstance(item, dict):
+                continue
+            parts = [
+                _short_source(str(item.get("source") or "")),
+                str(item.get("read_quality") or "?"),
+                f"conf={item.get('confidence', 0)}",
+            ]
+            reason = item.get("auth_assistance_reason") or item.get("blocked_by")
+            if reason:
+                parts.append(f"reason={reason}")
+            errors = item.get("errors") if isinstance(item.get("errors"), list) else []
+            if errors:
+                parts.append(f"errors={len(errors)}")
+            parts.append(str(item.get("failure_log_path") or ""))
+            failure_lines.append("- " + " | ".join(parts))
+        failure_block = "\n".join(failure_lines)
+    else:
+        failure_block = "- (none)"
+
     return f"""# Source Reader Status
 
 - Generated at: {report.get('generated_at')}
@@ -931,6 +1036,10 @@ def status_to_markdown(report: dict[str, object]) -> str:
 ## Recent Reads (last {len(recent)})
 
 {recent_block}
+
+## Recent Failures (last {len(recent_failures)})
+
+{failure_block}
 
 ## Playwright
 
@@ -1105,52 +1214,6 @@ def extract_html(html: str) -> tuple[str, str]:
     return extractor.title.strip(), extractor.text()
 
 
-def looks_like_auth_wall(requested_url: str, final_url: str, title: str, content: str) -> bool:
-    parsed_final = urllib.parse.urlparse(final_url)
-    parsed_requested = urllib.parse.urlparse(requested_url)
-    final_path = parsed_final.path.lower()
-    final_query = urllib.parse.parse_qs(parsed_final.query)
-    joined = f"{title}\n{content}".lower()
-    login_words = ("login", "signin", "sign in", "登录", "登陆", "授权", "认证")
-
-    if any(word in final_path for word in ("/login", "/signin", "/passport")):
-        return True
-    if any(key in final_query for key in ("goto", "redirect", "redirect_uri", "return_url", "next")):
-        if any(word in joined for word in login_words):
-            return True
-    if parsed_final.netloc == parsed_requested.netloc and len(content) < 300:
-        return any(word in joined for word in login_words)
-    return False
-
-
-def looks_like_js_shell(decoded: str, content: str) -> bool:
-    lowered = decoded.lower()
-    script_count = lowered.count("<script")
-    app_markers = (
-        'id="app"',
-        "id='app'",
-        'id="root"',
-        "id='root'",
-        "__next_data__",
-        "window.__initial_state__",
-        "webpack",
-        "vite",
-    )
-    if len(content) >= 1200:
-        return False
-    if any(marker in lowered for marker in app_markers) and script_count >= 2:
-        return True
-    if script_count >= 8 and len(content) < 500:
-        return True
-    return False
-
-
-def looks_like_cloudflare_block(content: str) -> bool:
-    text = content.lower()
-    markers = ("cloudflare", "cf-ray", "just a moment", "challenge-platform", "checking if the site connection")
-    return sum(1 for m in markers if m in text) >= 2
-
-
 def read_basic_url(url: str, max_chars: int) -> ReaderOutput:
     try:
         body, content_type, final_url = request_url(url)
@@ -1178,7 +1241,7 @@ def read_basic_url(url: str, max_chars: int) -> ReaderOutput:
         title, content = final_url, decoded
         strategy = "plain_text_response"
     content, clipped = cap_text(content, max_chars)
-    auth_wall = looks_like_auth_wall(url, final_url, title, content)
+    auth_wall, auth_reason = detect_access_limitation(url, final_url, title, content)
     js_shell = is_html and looks_like_js_shell(decoded, content)
     metadata: dict[str, object] = {
         "content_type": content_type,
@@ -1188,7 +1251,8 @@ def read_basic_url(url: str, max_chars: int) -> ReaderOutput:
     read_quality = "basic" if content else "partial"
     if auth_wall:
         read_quality = "blocked"
-        metadata["blocked_by"] = "auth_wall"
+        metadata["blocked_by"] = auth_reason
+        metadata["auth_assistance_reason"] = auth_reason
         errors.append("Page appears to require login or authorization. Retry with browser/auth reader.")
     elif js_shell:
         read_quality = "partial"
