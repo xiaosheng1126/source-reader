@@ -200,5 +200,39 @@ class ModelsTests(unittest.TestCase):
         self.assertIs(source_reader.ReaderOutput, _ModelsCls)
 
 
+class UtilsTests(unittest.TestCase):
+    def test_cap_text_no_clip_when_under_budget(self) -> None:
+        from reader_core.utils import cap_text
+        text = "hello world"
+        result, clipped = cap_text(text, 100)
+        self.assertEqual(result, text)
+        self.assertFalse(clipped)
+
+    def test_cap_text_clips_and_returns_true(self) -> None:
+        from reader_core.utils import cap_text
+        long_text = "a" * 1000
+        result, clipped = cap_text(long_text, 100)
+        self.assertTrue(clipped)
+        self.assertIn("[... content clipped", result)
+        self.assertLessEqual(len(result), 200)  # clipped text is longer than budget due to marker
+
+    def test_token_policy_not_clipped(self) -> None:
+        from reader_core.utils import token_policy
+        self.assertEqual(token_policy(6000, False), "max_chars=6000; full_within_budget")
+
+    def test_token_policy_clipped(self) -> None:
+        from reader_core.utils import token_policy
+        self.assertEqual(token_policy(6000, True), "max_chars=6000; clipped_head_tail")
+
+    def test_normalize_space_collapses_whitespace(self) -> None:
+        from reader_core.utils import normalize_space
+        self.assertEqual(normalize_space("a  b\t\tc"), "a b c")
+
+    def test_normalize_text_removes_extra_blank_lines(self) -> None:
+        from reader_core.utils import normalize_text
+        result = normalize_text("a\n\n\n\nb")
+        self.assertEqual(result, "a\n\nb")
+
+
 if __name__ == "__main__":
     unittest.main()

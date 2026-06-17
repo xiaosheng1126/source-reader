@@ -62,6 +62,7 @@ from reader_core.detectors import (  # noqa: E402
     looks_like_js_shell,
 )
 from reader_core.models import ReaderOutput
+from reader_core.utils import cap_text, normalize_space, normalize_text, token_policy
 
 
 
@@ -105,31 +106,6 @@ class TextExtractor(html.parser.HTMLParser):
     def text(self) -> str:
         return normalize_text("\n".join(self.parts))
 
-
-def normalize_space(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def normalize_text(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n[ \t]+", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def cap_text(text: str, max_chars: int) -> tuple[str, bool]:
-    text = normalize_text(text)
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text, False
-    head_chars = max(1, int(max_chars * 0.72))
-    tail_chars = max(1, max_chars - head_chars)
-    clipped = (
-        text[:head_chars].rstrip()
-        + "\n\n[... content clipped by source-reader to save tokens ...]\n\n"
-        + text[-tail_chars:].lstrip()
-    )
-    return clipped, True
 
 
 def estimate_tokens(text: str) -> int:
@@ -1815,10 +1791,6 @@ def read_file(path_text: str, max_chars: int) -> ReaderOutput:
         metadata={"suffix": suffix, "size_bytes": path.stat().st_size},
     )
 
-
-def token_policy(max_chars: int, clipped: bool) -> str:
-    suffix = "clipped_head_tail" if clipped else "full_within_budget"
-    return f"max_chars={max_chars}; {suffix}"
 
 
 def effective_max_chars(max_chars: int, read_depth: str) -> int:
