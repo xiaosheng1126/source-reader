@@ -1,0 +1,4 @@
+{
+  "_comment": "Copy to .source-reader/config.json and fill in values. Env vars (KEY_UPPER) override file values.",
+  "groq_api_key": ""
+}

@@ -54,7 +54,7 @@ def yt_dlp_env() -> dict[str, str]:
 def resolve_yt_dlp_command() -> tuple[list[str], dict[str, str] | None, str] | None:
     local_bin = yt_dlp_vendor_bin()
     if local_bin.exists():
-        return [str(local_bin)], None, "project_vendor_bin"
+        return [str(local_bin)], yt_dlp_env(), "project_vendor_bin"
     if yt_dlp_vendor_python_installed():
         return [sys.executable, "-m", "yt_dlp"], yt_dlp_env(), "project_vendor_python"
     if shutil.which("yt-dlp"):
@@ -142,3 +142,16 @@ def playwright_status() -> dict[str, object]:
 
 def scrapling_installed() -> bool:
     return importlib.util.find_spec("scrapling") is not None
+
+
+def groq_api_key() -> str | None:
+    from reader_core.config import get
+    return get("groq_api_key")
+
+
+def groq_status() -> dict[str, object]:
+    key = groq_api_key()
+    if not key:
+        return {"configured": False, "source": "missing"}
+    source = "env" if os.environ.get("GROQ_API_KEY") else "config"
+    return {"configured": True, "source": source}

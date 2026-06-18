@@ -63,6 +63,7 @@ from reader_core.models import ReaderOutput
 from reader_core.media import matches_video_host, read_video
 from reader_core.optional import (
     ffmpeg_path,
+    groq_status,
     playwright_installed,
     playwright_status,
     scrapling_installed,
@@ -917,6 +918,7 @@ def gather_status(recent_limit: int = 10) -> dict[str, object]:
         "playwright": playwright_status(),
         "yt_dlp": yt_dlp_status(),
         "whisper": whisper_status(),
+        "groq": groq_status(),
         "runtime": runtime_status(),
     }
 
@@ -927,6 +929,7 @@ def status_to_markdown(report: dict[str, object]) -> str:
     playwright = report.get("playwright") if isinstance(report.get("playwright"), dict) else {}
     yt_dlp = report.get("yt_dlp") if isinstance(report.get("yt_dlp"), dict) else {}
     whisper = report.get("whisper") if isinstance(report.get("whisper"), dict) else {}
+    groq = report.get("groq") if isinstance(report.get("groq"), dict) else {}
     runtime = report.get("runtime") if isinstance(report.get("runtime"), dict) else {}
     recent = report.get("recent_reads") if isinstance(report.get("recent_reads"), list) else []
     recent_failures = report.get("recent_failures") if isinstance(report.get("recent_failures"), list) else []
@@ -1040,6 +1043,11 @@ def status_to_markdown(report: dict[str, object]) -> str:
 - Model ready: {whisper.get('model_ready')} ({whisper.get('model_path') or 'n/a'})
 - ffmpeg: {whisper.get('ffmpeg') or 'not found'}
 - Version: {whisper.get('version') or 'n/a'}
+
+## Groq (online transcription)
+
+- Configured: {groq.get('configured')}
+- Source: {groq.get('source') or 'n/a'}
 
 ## Runtime
 

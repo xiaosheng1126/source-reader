@@ -35,6 +35,12 @@ class Installer:
         (self.root / ".source-reader" / "profiles" / "default").mkdir(parents=True, exist_ok=True)
         (self.root / ".source-reader" / "runs").mkdir(parents=True, exist_ok=True)
         (self.root / ".source-reader" / "mcp").mkdir(parents=True, exist_ok=True)
+        config_path = self.root / ".source-reader" / "config.json"
+        if not config_path.exists():
+            config_path.write_text(
+                json.dumps({"groq_api_key": ""}, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
 
     def write_mcp_runtime_files(self, port: int = 8765) -> None:
         if self.dry_run:
