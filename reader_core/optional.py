@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -121,6 +122,32 @@ def whisper_status() -> dict[str, object]:
         "model_path": str(model) if model else None,
         "ffmpeg": ffmpeg,
         "version": version,
+    }
+
+
+def pypdf_status() -> dict[str, object]:
+    spec = importlib.util.find_spec("pypdf")
+    if spec is None:
+        spec = importlib.machinery.PathFinder.find_spec("pypdf", [str(VENDOR_DIR)])
+    if spec is None:
+        return {
+            "installed": False,
+            "version": None,
+            "source": "missing",
+            "vendor_dir": str(VENDOR_DIR),
+            "license": "BSD-3-Clause",
+        }
+    ok, output = _run_check(
+        [sys.executable, "-c", "import pypdf; print(getattr(pypdf, '__version__', 'unknown'))"],
+        env=yt_dlp_env(),
+    )
+    return {
+        "installed": ok,
+        "version": output if ok else None,
+        "source": "project_vendor_or_pythonpath",
+        "vendor_dir": str(VENDOR_DIR),
+        "license": "BSD-3-Clause",
+        "message": "" if ok else output,
     }
 
 

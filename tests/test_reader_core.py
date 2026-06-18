@@ -157,6 +157,59 @@ class ActionPolicyTests(unittest.TestCase):
         self.assertEqual(actions[0]["id"], "install_yt_dlp")
         self.assertEqual(actions[0]["command"], "python3 scripts/install.py --install-yt-dlp")
 
+    def test_build_action_command_uses_read_action_entrypoint(self) -> None:
+        command = source_reader.build_action_command(
+            "extract_outline",
+            "README.md",
+            "md",
+            "fast",
+            ".source-reader/profiles/default",
+        )
+        self.assertIn("python3 scripts/source_reader.py read README.md", command)
+        self.assertIn("--action extract_outline", command)
+
+    def test_rewrite_actions_for_service_uses_read_remote_entrypoint(self) -> None:
+        result = source_reader.ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title="Example",
+            actions=[
+                {"id": "continue_deep_read", "command": "old"},
+                {"id": "extract_code", "command": "old"},
+            ],
+        )
+        rewritten = source_reader.rewrite_actions_for_service(result, "https://example.com/a", "127.0.0.1", 8765)
+        commands = [str(action.get("command") or "") for action in rewritten.actions]
+        self.assertIn("read https://example.com/a --remote --read-depth full", commands[0])
+        self.assertIn("read https://example.com/a --remote --action extract_code", commands[1])
+
+    def test_feedback_actions_use_read_feedback_entrypoint(self) -> None:
+        result = source_reader.ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title="Example",
+            run_id="run-1",
+        )
+        actions = source_reader.build_next_actions(
+            result,
+            "https://example.com/a",
+            "fast",
+            ".source-reader/profiles/default",
+            False,
+            False,
+            180000,
+        )
+        feedback_commands = {
+            action["id"]: action.get("command")
+            for action in actions
+            if action["id"] in {"mark_result_good", "mark_result_bad"}
+        }
+        self.assertEqual(
+            feedback_commands["mark_result_good"],
+            "python3 scripts/source_reader.py read --feedback good --run-id run-1",
+        )
+        self.assertIn("read --feedback bad --run-id run-1", str(feedback_commands["mark_result_bad"]))
+
 
 class FailureLogTests(unittest.TestCase):
     def test_failed_result_writes_failure_log(self) -> None:
@@ -185,6 +238,41 @@ class FailureLogTests(unittest.TestCase):
             finally:
                 source_reader.RUNS_DIR = original_runs_dir
                 source_reader.FAILURES_DIR = original_failures_dir
+
+    def test_failure_suggestions_group_by_domain_and_error_type(self) -> None:
+        failures = [
+            {
+                "source": "https://example.com/a",
+                "domain": "example.com",
+                "error_type": "js_shell",
+            },
+            {
+                "source": "https://example.com/b",
+                "domain": "example.com",
+                "error_type": "js_shell",
+            },
+            {
+                "source": "scan.pdf",
+                "domain": ".pdf",
+                "error_type": "pdf_no_text",
+            },
+        ]
+        suggestions = source_reader.failure_suggestions(failures)
+        self.assertEqual(suggestions[0]["domain"], "example.com")
+        self.assertEqual(suggestions[0]["error_type"], "js_shell")
+        self.assertEqual(suggestions[0]["count"], 2)
+
+    def test_classify_failure_type_detects_pdf_no_text(self) -> None:
+        result = source_reader.classify_failure_type({}, ["pdf has no extractable text"], "local_pdf_no_extractable_text")
+        self.assertEqual(result, "pdf_no_text")
+
+    def test_classify_failure_type_detects_broken_yt_dlp_vendor(self) -> None:
+        result = source_reader.classify_failure_type({}, ["ModuleNotFoundError: No module named 'yt_dlp'"], "video_audio_download_failed")
+        self.assertEqual(result, "missing_yt_dlp")
+
+    def test_classify_failure_type_detects_video_anti_bot(self) -> None:
+        result = source_reader.classify_failure_type({}, ["HTTP Error 403: Forbidden"], "video_audio_download_failed")
+        self.assertEqual(result, "anti_bot")
 
 
 class ModelsTests(unittest.TestCase):
@@ -313,7 +401,10 @@ class MediaTests(unittest.TestCase):
         with patch("reader_core.media.resolve_yt_dlp_command", return_value=(["yt-dlp"], None, "path")), patch(
             "reader_core.media.subprocess.run",
             return_value=mock_proc,
-        ), patch("reader_core.media.whisper_vendor_installed", return_value=False):
+        ), patch("reader_core.media.whisper_vendor_installed", return_value=False), patch(
+            "reader_core.media.groq_api_key",
+            return_value=None,
+        ):
             result = read_video("https://www.youtube.com/watch?v=test", 6000)
         self.assertEqual(result.read_quality, "partial")
         self.assertIn("whisper not installed", result.errors)
@@ -385,10 +476,10 @@ class StatusWhisperTests(unittest.TestCase):
     def test_status_markdown_includes_whisper_section(self) -> None:
         report = source_reader.gather_status(recent_limit=0)
         md = source_reader.status_to_markdown(report)
-        self.assertIn("## Whisper", md)
+        self.assertIn("## Whisper (heavy optional)", md)
         self.assertIn("Installed:", md)
 
-    def test_build_next_actions_includes_install_video_when_whisper_missing(self) -> None:
+    def test_build_next_actions_includes_heavy_whisper_when_whisper_missing(self) -> None:
         result = source_reader.ReaderOutput(
             input_type="url",
             source_type="video",
@@ -409,7 +500,126 @@ class StatusWhisperTests(unittest.TestCase):
             180000,
         )
         action_ids = [action["id"] for action in actions]
-        self.assertIn("install_video", action_ids)
+        self.assertIn("install_local_whisper_heavy", action_ids)
+
+
+class PdfTests(unittest.TestCase):
+    def test_read_local_pdf_partial_when_pypdf_missing(self) -> None:
+        from unittest.mock import patch
+
+        from reader_core.pdf import read_local_pdf
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+            pathlib.Path(tmp.name).write_bytes(b"%PDF-1.4\n")
+            with patch("reader_core.pdf._load_pdf_reader", return_value=None):
+                result = read_local_pdf(pathlib.Path(tmp.name), 6000)
+        self.assertEqual(result.source_type, "pdf")
+        self.assertEqual(result.read_quality, "partial")
+        self.assertEqual(result.strategy, "local_pdf_missing_pypdf")
+        self.assertIn("pypdf not installed", result.errors)
+
+    def test_read_local_pdf_extracts_text_with_pypdf(self) -> None:
+        from unittest.mock import patch
+
+        from reader_core.pdf import read_local_pdf
+
+        class Page:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            def extract_text(self) -> str:
+                return self.text
+
+        class FakePdfReader:
+            def __init__(self, path: str) -> None:
+                self.pages = [Page("First page"), Page("Second page")]
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+            pathlib.Path(tmp.name).write_bytes(b"%PDF-1.4\n")
+            with patch("reader_core.pdf._load_pdf_reader", return_value=FakePdfReader):
+                result = read_local_pdf(pathlib.Path(tmp.name), 6000)
+        self.assertEqual(result.read_quality, "basic")
+        self.assertEqual(result.strategy, "local_pdf_pypdf_text_extraction")
+        self.assertIn("First page", result.content)
+        self.assertEqual(result.metadata["page_count"], 2)
+
+    def test_read_local_pdf_no_extractable_text_is_partial(self) -> None:
+        from unittest.mock import patch
+
+        from reader_core.pdf import read_local_pdf
+
+        class Page:
+            def extract_text(self) -> str:
+                return ""
+
+        class FakePdfReader:
+            def __init__(self, path: str) -> None:
+                self.pages = [Page()]
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+            pathlib.Path(tmp.name).write_bytes(b"%PDF-1.4\n")
+            with patch("reader_core.pdf._load_pdf_reader", return_value=FakePdfReader):
+                result = read_local_pdf(pathlib.Path(tmp.name), 6000)
+        self.assertEqual(result.read_quality, "partial")
+        self.assertEqual(result.strategy, "local_pdf_no_extractable_text")
+        self.assertIn("pdf has no extractable text", result.errors)
+
+    def test_gather_status_includes_pdf_key(self) -> None:
+        report = source_reader.gather_status(recent_limit=0)
+        self.assertIn("pdf", report)
+        self.assertIn("installed", report["pdf"])
+
+    def test_status_markdown_includes_pdf_section(self) -> None:
+        report = source_reader.gather_status(recent_limit=0)
+        md = source_reader.status_to_markdown(report)
+        self.assertIn("## PDF", md)
+
+    def test_build_next_actions_includes_install_pdf_reader_when_missing(self) -> None:
+        result = source_reader.ReaderOutput(
+            input_type="file",
+            source_type="pdf",
+            title="sample",
+            read_quality="partial",
+            strategy="local_pdf_missing_pypdf",
+            token_policy="max_chars=6000; full_within_budget",
+            content="",
+            errors=["pypdf not installed"],
+        )
+        actions = source_reader.build_next_actions(
+            result,
+            "sample.pdf",
+            "fast",
+            ".source-reader/profiles/default",
+            False,
+            False,
+            180000,
+        )
+        action_ids = [action["id"] for action in actions]
+        self.assertIn("install_pdf_reader", action_ids)
+
+    def test_online_pdf_action_requires_external_upload(self) -> None:
+        result = source_reader.ReaderOutput(
+            input_type="file",
+            source_type="pdf",
+            title="scan",
+            read_quality="partial",
+            strategy="local_pdf_no_extractable_text",
+            token_policy="max_chars=6000; full_within_budget",
+            content="",
+            errors=["pdf has no extractable text"],
+        )
+        actions = source_reader.build_next_actions(
+            result,
+            "scan.pdf",
+            "fast",
+            ".source-reader/profiles/default",
+            False,
+            False,
+            180000,
+        )
+        upload_actions = [action for action in actions if action["id"] == "online_pdf_parse_explicit_upload"]
+        self.assertEqual(len(upload_actions), 1)
+        self.assertTrue(upload_actions[0]["requires_external_upload"])
 
 
 class InstallVideoTests(unittest.TestCase):

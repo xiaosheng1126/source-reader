@@ -1,170 +1,174 @@
-# Source Reader 短期执行计划（v1）
+# Source Reader 短期执行计划（v2）
 
-> 时间盒：约 2 周。目标：把"读"做到 **简单、好用、不费 token、聪明一点**。
-> 定位：**给 Codex / Claude Code 用的本机阅读层，专读云端 reader 进不来的内容**——登录态网站、内网文档、本地文件、付费订阅。
+目标：把 source-reader 收敛成稳定的本机阅读层。优先解决输入能力边界和回归稳定性，再做入口收敛、失败闭环和站点规则增强。
 
-## 决策已定（不再讨论）
+## 当前进度
 
-| 决策点 | 选择 |
-|---|---|
-| 自动升 browser | **默认开**；新增 `--no-auto-upgrade` 兜底。 |
-| confidence 阈值 | **写死 40**，跑两周看数据再调，不做 config。 |
-| profile 老化提示 | **14 天黄、30 天红**。 |
-| 旧 `--install-runtime` flag | **保留 1 个版本**兼容，下下个版本删除。 |
-| 节奏 | 单线 PR1 → PR6 顺序推进，每个 PR 改完跑验证、合并、再下一个。 |
+- 已落地：阶段 1 PDF 本地轻量读取。
+- 已落地：阶段 2 Whisper 降级为高级可选能力。
+- 已落地：阶段 3 action/feedback/remote 推荐命令收敛到 `read` 主入口；旧入口保留兼容。
+- 已落地：阶段 4 status 基于 failure log 输出 Suggestions。
+- 待样本驱动：阶段 5 站点规则机制增强。
 
-## PR 顺序与依赖
+## 阶段 1：PDF 本地轻量读取
 
-```
-PR1  confidence + auto-upgrade
-   ↓
-PR2  history.db (SQLite)
-   ↓
-PR3  status 命令
-   ↓
-PR4  profile 健康 + rotate   ──┐ 可并行
-PR5  Playwright lazy install ──┘
-   ↓
-PR6  CLI 收敛 + 文档定位收敛
-```
+目标：文本型本地 PDF 可读；扫描型、复杂版式和在线 PDF 明确降级。
 
-## PR1 — `confidence` 字段 + 自动升 browser
+实施：
 
-**目标**：失败可见、低质量 fast 读取自动升级到 browser。
+- 新增 `reader_core/pdf.py`，默认使用可选依赖 `pypdf`。
+- 本地 `.pdf` 文件走 PDF reader，不再按 UTF-8 文本误读。
+- `pypdf` 缺失时返回 `partial`，附 `install_pdf_reader` action，建议安装到 `.source-reader/vendor`。
+- 扫描型或无可提取文本 PDF 返回 `partial`，提示当前阶段不做 OCR。
+- URL PDF 不默认上传在线服务；arXiv PDF 继续转摘要页。
+- `status` / `doctor` 增加 PDF reader 状态，但缺失不影响整体健康状态。
 
-**做的事**
-- `ReaderOutput` 加 `confidence: int`（0–100），保留 `read_quality` 兼容。
-- 新增 `score_confidence(result)`：综合内容长度、headings、auth_wall、js_shell、errors、read_quality 计算。
-- `attach_interaction` 统一回填 confidence。
-- `classify_and_read`：mode=`fast` 或 `auto` 且 confidence < 40 且 browser 可用时，**自动升级**；metadata 标 `auto_upgraded: true` + 原因。
-- 解析默认 browser_profile：未传时回落到 `.source-reader/profiles/default`（存在时）。
-- 新增 `--no-auto-upgrade` flag。
-- `build_preview`、`to_markdown` 显示 confidence。
+不做：
 
-**验证**
-```bash
-python3 -m py_compile scripts/source_reader.py
-python3 scripts/source_reader.py README.md --format json | jq .confidence
-python3 scripts/source_reader.py --doctor --format md
-```
+- 不做 OCR。
+- 不做表格还原、双栏重排、复杂版式修复。
+- 不默认把 PDF 上传给在线模型。
+- 不引入 `PyMuPDF` 作为默认依赖。
 
-## PR2 — `history.db`（SQLite）
+## 阶段 2：Whisper 降级为高级可选能力
 
-**目标**：读过的可查；为 status / 自动化策略提供数据底座。
+目标：视频读取默认轻量，Whisper 不再被表达成普通必装能力。
 
-**做的事**
-- 新文件 `.source-reader/history.db`，schema：
-  ```sql
-  CREATE TABLE reads(
-    id INTEGER PRIMARY KEY,
-    url TEXT, source_type TEXT, title TEXT,
-    fetched_at TEXT, run_id TEXT UNIQUE,
-    mode TEXT, read_depth TEXT,
-    confidence INTEGER, content_chars INTEGER,
-    auto_upgraded INTEGER, errors_json TEXT
-  );
-  CREATE INDEX idx_reads_url ON reads(url);
-  CREATE INDEX idx_reads_fetched_at ON reads(fetched_at);
-  ```
-- `persist_run_log` 同时写 JSON + 插入一行。
-- 首次启动**回填**已有 `runs/*.json`。
-- `classify_and_read` 入口检查 7 天内同 URL 历史，命中时 metadata 加 `history_hit`，**不阻断**。
+实施：
 
-**验证**
-```bash
-python3 scripts/source_reader.py README.md --format md
-python3 scripts/source_reader.py README.md --format md   # 第二次应有 history_hit
-sqlite3 .source-reader/history.db "select count(*) from reads;"
-```
+- 视频读取顺序保持：字幕优先，其次在线转写配置，本地 Whisper 作为重型兜底。
+- `status` 将 Whisper 标为 `heavy optional`。
+- `actions` 区分 `install_yt_dlp`、在线转写配置、本地 Whisper 重型安装。
+- 修复测试隔离：无转写能力测试必须同时 mock 掉本机 Groq 配置。
 
-## PR3 — `status` 命令
+不做：
 
-**目标**：一条命令看全状态，告别 `tail log`。
+- 不默认下载 Whisper 模型。
+- 不把本地 Whisper 作为安装主路径。
+- 不改变已有 `--install-video` 兼容入口。
 
-**做的事**
-- 新子命令 `python3 scripts/source_reader.py status [--format md|json] [--recent N]`。
-- 输出 5 块：
-  1. **service**：pid 健康 + 端口 + uptime + 最后心跳。
-  2. **profile**：路径、大小、最近成功用它读取的时间；14 天黄、30 天红。
-  3. **recent reads**：history.db 最近 N 条（默认 10）。
-  4. **playwright**：是否装好、版本。
-  5. **runtime**：Python 版本、平台、`.source-reader/` 大小。
-- `review-runs` 内部保留，但文档转向 `status --recent`。
+## 阶段 3：入口收敛
 
-**验证**
-```bash
-python3 scripts/source_reader.py status --format md
-python3 scripts/source_reader.py status --format json | jq .
-```
+目标：对外只讲 `read / serve / status`，旧入口保留兼容。
 
-## PR4 — Profile 健康 + `profile rotate` + 安全警告
+实施：
 
-**目标**：登录态可见、不掉、不泄露。
+- README、adapter、MCP tool 描述统一到主入口。
+- 旧命令不删除，只从主文档中降级为内部兼容入口。
+- `build_action_command()` 和服务端 action 统一生成新入口命令。
 
-**做的事**
-- 新子命令 `python3 scripts/source_reader.py profile <info|rotate> [--name default]`。
-  - `info`：路径、大小、上次成功时间、cookie 文件数（粗略）。
-  - `rotate`：备份到 `.source-reader/profiles/<name>.bak-<ts>/`，新建空 profile。
-- `install.py` 输出尾部、`README.md` browser 段、`status` 输出统一加固定警告：
-  > `.source-reader/profiles/` 含登录态等敏感凭据，禁止提交 Git、禁止分享项目目录给他人。
+不做：
 
-**验证**
-```bash
-python3 scripts/source_reader.py profile info --format md
-python3 scripts/source_reader.py profile rotate --format md
-ls -la .source-reader/profiles/
-```
+- 不静默破坏旧命令。
+- 不一次性改 MCP 输出 schema。
 
-## PR5 — Playwright lazy install
+## 阶段 4：失败闭环
 
-**目标**：轻用户不必装 300MB Chromium。
+目标：让 `status` 能解释最近失败，而不是只列 run log。
 
-**做的事**
-- `install.py` 拆分：
-  - `--install-core`（npm install 不跑 chromium）
-  - `--install-browser`（运行 `npx playwright install chromium`）
-  - 旧 `--install-runtime` = `--install-core --install-browser`，保留 1 版本。
-- `read_browser_url` 启动前显式检查 `node_modules/playwright`；未装时返回明确错误 + 安装命令，不再静默失败。
-- `--doctor` 区分"browser 模式可用 / 当前未装"。
-- README 默认安装命令改为不含 chromium 的版本。
+实施：
 
-**验证**
-```bash
-python3 scripts/install.py --install-mcp --start-service     # 不装 Chromium
-python3 scripts/source_reader.py <静态网页> --mode fast       # 应正常
-python3 scripts/source_reader.py <JS 站> --mode browser ...   # 应明确报"请装 browser"
-python3 scripts/install.py --install-browser                  # 装上
-python3 scripts/source_reader.py --doctor --format md
-```
+- 聚合 `.source-reader/failures/*.json`。
+- 按 `domain + strategy + error_type` 统计最近失败。
+- 在 `status` 输出 suggestions，例如登录态过期、JS shell、缺依赖、PDF 无文本。
 
-## PR6 — CLI 收敛 + 定位文案
+不做：
 
-**目标**：对外只露 3 个入口（`read` / `serve` / `status`）+ 定位陈述就位。
+- 不引入 SQLite。
+- 不做大仪表盘。
+- 不自动修复、自动登录或自动新增站点规则。
 
-**做的事**
-- 文档（README/AGENTS.md/adapters/根 CLAUDE.md）只讲 3 个入口；旧子命令保留但不文档化。
-- 新 flags：`read --action`, `read --feedback`, `read --remote`, `serve --mcp`。
-- 旧 `mcp` 入口**保留**（install.py 写的 wrapper 仍在用），文档不推荐。
-- 各文档首段替换为：
-  > source-reader 是给 Codex / Claude Code 用的本机阅读层，专读云端 reader 进不来的内容：登录态网站、内网文档、本地文件、付费订阅。
-- 删掉 README 里"通用 reader"暗示和未实现的策略 JSON 段。
+## 阶段 5：站点规则机制增强
 
-**验证**
-- 老命令仍工作（兼容性回归）。
-- 新命令工作。
-- `grep -E "remote-read|review-runs|^action " README.md AGENTS.md` 命中应只在"内部细节"段。
+目标：只从高频失败样本补规则，避免做大而全爬虫。
 
-## 总验证（每个 PR 都跑）
+实施：
+
+- 从 failure log 选择高频站点。
+- 每个规则只处理登录墙识别、JS shell 识别、目标正文判断和后续 action 建议。
+- 每个新增站点规则必须有 detector 测试。
+
+不做：
+
+- 不为低频站点写一次性规则。
+- 不在规则里写知识库逻辑。
+
+## 回归测试计划
+
+每次代码改动至少跑：
 
 ```bash
-python3 -m py_compile scripts/source_reader.py scripts/install.py
+python3 -m py_compile scripts/source_reader.py scripts/install.py reader_core/pdf.py
 python3 scripts/source_reader.py README.md --read-depth preview --format json
 python3 scripts/source_reader.py --doctor --format md
+python3 scripts/source_reader.py status --format md
+python3 -m unittest discover -s tests
 ```
 
-## 不在本计划（明确砍掉）
+PDF 专项：
 
-- 缓存层（ROI 没那么大，挪到中期）
-- 新站点抽取器、批量读、对比读、主动阅读 Agent
-- 隐式反馈数据采集 + domain 策略自学习（中期 P0，需要 PR2 数据底座先到位）
-- Profile 加密、多 user namespace、Chrome 扩展
+```bash
+python3 scripts/source_reader.py <text-pdf> --read-depth preview --format json
+python3 scripts/source_reader.py <scan-or-empty-pdf> --read-depth preview --format json
+python3 scripts/source_reader.py <broken-pdf> --read-depth preview --format json
+```
+
+预期：
+
+- 文本型 PDF：`source_type=pdf`，`strategy=local_pdf_pypdf_text_extraction`。
+- 缺少 `pypdf`：`read_quality=partial`，包含 `install_pdf_reader` action。
+- 扫描型或空文本 PDF：`read_quality=partial`，包含显式在线解析 action，但不自动上传。
+- 损坏 PDF：`read_quality=failed`，错误可读。
+
+视频专项：
+
+```bash
+python3 -m unittest tests.test_reader_core.MediaTests
+python3 scripts/source_reader.py status --format md
+```
+
+预期：
+
+- 无 `yt-dlp`：返回 `partial` 和 `install_yt_dlp` action。
+- 有 `yt-dlp` 但无字幕、无 Groq、无 Whisper：返回 `partial`，提示转写能力缺失。
+- `status` 中 Whisper 标为 heavy optional。
+
+入口收敛专项：
+
+```bash
+python3 scripts/source_reader.py read README.md --read-depth preview --format md
+python3 scripts/source_reader.py README.md --read-depth preview --format md
+python3 scripts/source_reader.py status --format json
+python3 scripts/source_reader.py serve --mcp --help
+```
+
+预期：
+
+- 新入口工作。
+- 旧入口仍兼容。
+- README/adapters 只推荐 `read / serve / status`。
+
+失败闭环专项：
+
+```bash
+python3 scripts/source_reader.py status --recent 20 --format md
+python3 -m unittest discover -s tests
+```
+
+预期：
+
+- 最近失败样本可见。
+- suggestions 按失败类型聚合。
+- failure log 缺失或损坏时不影响 status。
+
+站点规则专项：
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+预期：
+
+- 每个新增 `site_rules/<domain>.py` 都有 detector 覆盖。
+- 登录墙、JS shell、受限视图误判率可控。
+- 没有把站点规则写进知识库流程。

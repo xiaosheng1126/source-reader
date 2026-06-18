@@ -66,10 +66,12 @@ from reader_core.optional import (
     groq_status,
     playwright_installed,
     playwright_status,
+    pypdf_status,
     scrapling_installed,
     whisper_status,
     yt_dlp_status,
 )
+from reader_core.pdf import read_local_pdf
 from reader_core.utils import cap_text, normalize_space, normalize_text, token_policy
 
 
@@ -227,6 +229,7 @@ def build_command(
     parts = [
         "python3",
         "scripts/source_reader.py",
+        "read",
         shell_quote(source),
         "--read-depth",
         read_depth,
@@ -275,6 +278,7 @@ def action(
     category: str = "read",
     scope: str = "reader",
     adapter: str = "",
+    requires_external_upload: bool = False,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "id": action_id,
@@ -286,6 +290,8 @@ def action(
     }
     if adapter:
         payload["adapter"] = adapter
+    if requires_external_upload:
+        payload["requires_external_upload"] = True
     if command:
         payload["command"] = command
     if prompt:
@@ -337,7 +343,7 @@ def build_next_actions(
                     "mark_result_good",
                     "结果可用",
                     "记录本次读取满足预期，用于后续复盘读取策略。",
-                    command=f"python3 scripts/source_reader.py feedback mark_good --run-id {shell_quote(result.run_id)}",
+                    command=f"python3 scripts/source_reader.py read --feedback good --run-id {shell_quote(result.run_id)}",
                     requires_confirmation=False,
                     category="feedback",
                 ),
@@ -345,7 +351,7 @@ def build_next_actions(
                     "mark_result_bad",
                     "结果不对",
                     "记录本次读取不满足预期，并补充原因帮助后续改进。",
-                    command=f"python3 scripts/source_reader.py feedback mark_bad --run-id {shell_quote(result.run_id)} --reason '<reason>'",
+                    command=f"python3 scripts/source_reader.py read --feedback bad --run-id {shell_quote(result.run_id)} --reason '<reason>'",
                     requires_confirmation=False,
                     category="feedback",
                 ),
@@ -373,13 +379,36 @@ def build_next_actions(
                 category="setup",
             ),
         )
+    if any("pypdf not installed" in error for error in result.errors):
+        actions.insert(
+            0,
+            action(
+                "install_pdf_reader",
+                "安装轻量 PDF 读取依赖",
+                "安装 pypdf 到项目本地 .source-reader/vendor，用于读取文本型本地 PDF；不上传文件。",
+                command="python3 -m pip install --target .source-reader/vendor pypdf",
+                category="setup",
+            ),
+        )
+    if result.source_type == "pdf" and result.strategy in {"local_pdf_no_extractable_text", "pdf_binary_detected_no_extractor"}:
+        actions.insert(
+            0,
+            action(
+                "online_pdf_parse_explicit_upload",
+                "显式上传给在线模型解析",
+                "仅在用户确认后，把 PDF 上传给支持文档输入的在线模型；适合扫描件或复杂版式。",
+                category="external",
+                adapter="requires_external_upload",
+                requires_external_upload=True,
+            ),
+        )
     if any("whisper not installed" in error or "whisper model not found" in error for error in result.errors):
         actions.insert(
             0,
             action(
-                "install_video",
-                "安装 Whisper 视频转写",
-                "安装 faster-whisper 到 .source-reader/vendor，并下载 medium 模型（~769MB），无字幕视频可转写。",
+                "install_local_whisper_heavy",
+                "安装本地 Whisper 转写",
+                "高级可选能力：安装 faster-whisper 到 .source-reader/vendor，并下载 medium 模型（~769MB），无字幕视频可本地转写。",
                 command="python3 scripts/install.py --install-video",
                 category="setup",
             ),
@@ -424,9 +453,9 @@ def build_next_actions(
 
 def build_action_command(action_id: str, source: str, fmt: str, mode: str, browser_profile: str) -> str:
     return (
-        "python3 scripts/source_reader.py action "
-        f"{shell_quote(action_id)} --source {shell_quote(source)} "
-        f"--format {fmt} --mode {mode} --browser-profile {shell_quote(browser_profile)}"
+        f"python3 scripts/source_reader.py read {shell_quote(source)} "
+        f"--action {shell_quote(action_id)} --format {fmt} "
+        f"--mode {mode} --browser-profile {shell_quote(browser_profile)}"
     )
 
 
@@ -498,6 +527,7 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
     scrapling_ok = scrapling_installed()
     yt_dlp = yt_dlp_status()
     whisper_s = whisper_status()
+    pypdf_s = pypdf_status()
     ffmpeg = ffmpeg_path()
     checks = {
         "root": str(ROOT_DIR),
@@ -509,6 +539,7 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
         "yt_dlp": yt_dlp,
         "whisper_installed": whisper_s["installed"],
         "whisper_model_ready": whisper_s["model_ready"],
+        "pypdf": pypdf_s,
         "ffmpeg": ffmpeg or "not found",
         "scrapling": scrapling_ok,
         "browser_profile": profile_path.exists(),
@@ -529,8 +560,13 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
         )
     if not whisper_s["installed"]:
         recommendations.append(
-            "Whisper (audio transcription for videos without subtitles) is optional. "
+            "Local Whisper is a heavy optional fallback for videos without subtitles. "
             "Run: python3 scripts/install.py --install-video"
+        )
+    if not pypdf_s["installed"]:
+        recommendations.append(
+            "Local PDF text reading is optional. Install pypdf into project vendor when needed: "
+            "python3 -m pip install --target .source-reader/vendor pypdf"
         )
     if not scrapling_ok:
         recommendations.append(
@@ -642,20 +678,94 @@ def recent_failures_from_logs(limit: int = 10) -> list[dict[str, object]]:
         if not isinstance(payload, dict):
             continue
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        source = str(payload.get("source") or "")
+        errors = payload.get("errors") or []
         output.append(
             {
                 "run_id": payload.get("run_id"),
-                "source": payload.get("source"),
+                "source": source,
+                "domain": failure_domain(source),
                 "read_quality": payload.get("read_quality"),
                 "confidence": int(payload.get("confidence") or 0),
                 "strategy": payload.get("strategy"),
                 "blocked_by": metadata.get("blocked_by"),
                 "auth_assistance_reason": metadata.get("auth_assistance_reason"),
-                "errors": payload.get("errors") or [],
+                "error_type": classify_failure_type(metadata, errors, str(payload.get("strategy") or "")),
+                "errors": errors,
                 "failure_log_path": display_path(path),
             }
         )
     return output
+
+
+def failure_domain(source: str) -> str:
+    parsed = urllib.parse.urlparse(source)
+    if parsed.netloc:
+        return parsed.netloc.lower()
+    suffix = pathlib.Path(source).suffix.lower()
+    return suffix or "local_file"
+
+
+def classify_failure_type(metadata: dict[str, object], errors: object, strategy: str) -> str:
+    if metadata.get("blocked_by") == "auth_wall" or metadata.get("auth_assistance_reason"):
+        return "auth"
+    error_text = " ".join(str(item).lower() for item in errors) if isinstance(errors, list) else str(errors).lower()
+    if "yt-dlp not found" in error_text or "no module named 'yt_dlp'" in error_text:
+        return "missing_yt_dlp"
+    if "pypdf not installed" in error_text:
+        return "missing_pypdf"
+    if "pdf has no extractable text" in error_text or strategy == "local_pdf_no_extractable_text":
+        return "pdf_no_text"
+    if "http error 403" in error_text or "challenge solving failed" in error_text:
+        return "anti_bot"
+    if "whisper" in error_text or "groq not configured" in error_text:
+        return "video_transcription"
+    if strategy.startswith("video_") and "subtitle not found" in error_text:
+        return "video_transcription"
+    if metadata.get("maybe_js_rendered") or "js_shell" in strategy:
+        return "js_shell"
+    if metadata.get("blocked_by") == "cloudflare" or "cloudflare" in error_text:
+        return "anti_bot"
+    return "read_failure"
+
+
+def failure_suggestions(failures: list[dict[str, object]], limit: int = 5) -> list[dict[str, object]]:
+    counts: dict[tuple[str, str], int] = {}
+    for item in failures:
+        domain = str(item.get("domain") or "unknown")
+        error_type = str(item.get("error_type") or "read_failure")
+        key = (domain, error_type)
+        counts[key] = counts.get(key, 0) + 1
+    ranked = sorted(counts.items(), key=lambda entry: entry[1], reverse=True)
+    suggestions: list[dict[str, object]] = []
+    for (domain, error_type), count in ranked[:limit]:
+        suggestions.append(
+            {
+                "domain": domain,
+                "error_type": error_type,
+                "count": count,
+                "suggestion": suggestion_for_failure(error_type, domain),
+            }
+        )
+    return suggestions
+
+
+def suggestion_for_failure(error_type: str, domain: str) -> str:
+    if error_type == "auth":
+        return f"{domain}: 登录态或权限受限，优先用 read --action login_with_browser 重试。"
+    if error_type == "missing_yt_dlp":
+        return f"{domain}: 缺少视频字幕读取依赖，运行 python3 scripts/install.py --install-yt-dlp。"
+    if error_type == "missing_pypdf":
+        return "本地 PDF: 缺少 pypdf，运行 python3 -m pip install --target .source-reader/vendor pypdf。"
+    if error_type == "pdf_no_text":
+        return "PDF: 没有可提取文本，可能是扫描件；需要用户显式选择在线模型解析或 OCR。"
+    if error_type == "video_transcription":
+        return f"{domain}: 视频无字幕且转写能力不可用；优先配置在线转写，本地 Whisper 作为重型兜底。"
+    if error_type == "js_shell":
+        return f"{domain}: fast 读取疑似 JS 空壳，使用 browser 模式或补站点规则。"
+    if error_type == "anti_bot":
+        return f"{domain}: 疑似反爬拦截，优先 browser 模式，必要时再启用 Scrapling。"
+    return f"{domain}: 读取失败样本较多，查看 failure log 后再决定是否补站点规则。"
 
 
 def persist_run_log(result: ReaderOutput, source: str, invocation: dict[str, object]) -> pathlib.Path:
@@ -909,16 +1019,19 @@ def runtime_status() -> dict[str, object]:
 
 
 def gather_status(recent_limit: int = 10) -> dict[str, object]:
+    recent_failures = recent_failures_from_logs(recent_limit)
     return {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "service": service_status(),
         "profile": profile_status(),
         "recent_reads": recent_reads_from_runs(recent_limit),
-        "recent_failures": recent_failures_from_logs(recent_limit),
+        "recent_failures": recent_failures,
+        "suggestions": failure_suggestions(recent_failures),
         "playwright": playwright_status(),
         "yt_dlp": yt_dlp_status(),
         "whisper": whisper_status(),
         "groq": groq_status(),
+        "pdf": pypdf_status(),
         "runtime": runtime_status(),
     }
 
@@ -930,9 +1043,11 @@ def status_to_markdown(report: dict[str, object]) -> str:
     yt_dlp = report.get("yt_dlp") if isinstance(report.get("yt_dlp"), dict) else {}
     whisper = report.get("whisper") if isinstance(report.get("whisper"), dict) else {}
     groq = report.get("groq") if isinstance(report.get("groq"), dict) else {}
+    pdf = report.get("pdf") if isinstance(report.get("pdf"), dict) else {}
     runtime = report.get("runtime") if isinstance(report.get("runtime"), dict) else {}
     recent = report.get("recent_reads") if isinstance(report.get("recent_reads"), list) else []
     recent_failures = report.get("recent_failures") if isinstance(report.get("recent_failures"), list) else []
+    suggestions = report.get("suggestions") if isinstance(report.get("suggestions"), list) else []
 
     if service.get("running"):
         uptime = service.get("uptime_seconds") or 0
@@ -985,6 +1100,8 @@ def status_to_markdown(report: dict[str, object]) -> str:
                 str(item.get("read_quality") or "?"),
                 f"conf={item.get('confidence', 0)}",
             ]
+            if item.get("error_type"):
+                parts.append(f"type={item.get('error_type')}")
             reason = item.get("auth_assistance_reason") or item.get("blocked_by")
             if reason:
                 parts.append(f"reason={reason}")
@@ -996,6 +1113,18 @@ def status_to_markdown(report: dict[str, object]) -> str:
         failure_block = "\n".join(failure_lines)
     else:
         failure_block = "- (none)"
+
+    if suggestions:
+        suggestion_lines: list[str] = []
+        for item in suggestions:
+            if not isinstance(item, dict):
+                continue
+            suggestion_lines.append(
+                f"- {item.get('domain')} | {item.get('error_type')} | count={item.get('count')}: {item.get('suggestion')}"
+            )
+        suggestion_block = "\n".join(suggestion_lines)
+    else:
+        suggestion_block = "- (none)"
 
     return f"""# Source Reader Status
 
@@ -1025,6 +1154,10 @@ def status_to_markdown(report: dict[str, object]) -> str:
 
 {failure_block}
 
+## Suggestions
+
+{suggestion_block}
+
 ## Playwright
 
 - Installed: {playwright.get('installed')}
@@ -1037,7 +1170,14 @@ def status_to_markdown(report: dict[str, object]) -> str:
 - Version: {yt_dlp.get('version') or 'n/a'}
 - Vendor dir: {yt_dlp.get('vendor_dir') or 'n/a'}
 
-## Whisper
+## PDF
+
+- pypdf installed: {pdf.get('installed')}
+- Version: {pdf.get('version') or 'n/a'}
+- Vendor dir: {pdf.get('vendor_dir') or 'n/a'}
+- License: {pdf.get('license') or 'n/a'}
+
+## Whisper (heavy optional)
 
 - Installed: {whisper.get('installed')}
 - Model ready: {whisper.get('model_ready')} ({whisper.get('model_path') or 'n/a'})
@@ -1653,7 +1793,11 @@ def read_pdf(url: str, max_chars: int) -> ReaderOutput:
     if result.content.startswith("%PDF"):
         result.read_quality = "partial"
         result.strategy = "pdf_binary_detected_no_extractor"
-        result.content = "检测到 PDF 二进制内容。当前轻量版不解析 PDF；建议后续接入 pdftotext 或 pymupdf，只提取标题、摘要、章节和结论。"
+        result.content = (
+            "检测到 URL PDF 二进制内容。当前不会默认下载并上传 PDF；"
+            "建议先下载到本地后用轻量 pypdf 文本读取。扫描件或复杂版式需要用户显式选择在线模型解析。"
+        )
+        result.metadata["requires_external_upload"] = True
     return result
 
 
@@ -1663,9 +1807,11 @@ def read_file(path_text: str, max_chars: int) -> ReaderOutput:
         raise RuntimeError(f"file does not exist: {path}")
     if not path.is_file():
         raise RuntimeError(f"not a file: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return read_local_pdf(path, max_chars)
     text = path.read_text(encoding="utf-8", errors="replace")
     content, clipped = cap_text(text, max_chars)
-    suffix = path.suffix.lower()
     source_type = "local_file"
     if suffix in {".md", ".markdown"}:
         source_type = "markdown"
@@ -2448,13 +2594,13 @@ def rewrite_actions_for_service(result: ReaderOutput, source: str, host: str, po
         action_id = str(copied.get("id") or "")
         if action_id == "continue_deep_read":
             copied["command"] = (
-                f"python3 scripts/source_reader.py remote-read {shell_quote(source)} "
-                f"--read-depth full --format md --host {host} --port {port}"
+                f"python3 scripts/source_reader.py read {shell_quote(source)} --remote "
+                f"--read-depth full --format md --service-host {host} --service-port {port}"
             )
         elif action_id in {"extract_outline", "extract_code", "login_with_browser"}:
             copied["command"] = (
-                f"python3 scripts/source_reader.py remote-action {shell_quote(action_id)} "
-                f"--source {shell_quote(source)} --format md --host {host} --port {port}"
+                f"python3 scripts/source_reader.py read {shell_quote(source)} --remote "
+                f"--action {shell_quote(action_id)} --format md --service-host {host} --service-port {port}"
             )
         rewritten.append(copied)
     result.actions = rewritten
