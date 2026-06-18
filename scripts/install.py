@@ -127,6 +127,105 @@ class Installer:
             check=True,
         )
 
+    def _print_ffmpeg_hint(self) -> None:
+        import platform as _platform
+
+        if shutil.which("ffmpeg"):
+            return
+        system = _platform.system()
+        if system == "Darwin":
+            try:
+                version = subprocess.run(
+                    ["sw_vers", "-productVersion"],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                arch = subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip()
+                hint = f"brew install ffmpeg  # macOS {version} {arch}"
+            except OSError:
+                hint = "brew install ffmpeg"
+        elif system == "Linux":
+            hint = "sudo apt install ffmpeg  # or sudo yum install ffmpeg"
+        else:
+            hint = "Install ffmpeg and ensure it is available in PATH"
+        print(f"\n[warning] ffmpeg not found, audio transcription cannot work. Install it first:\n  {hint}")
+
+    def install_video(self) -> None:
+        vendor_dir = self.root / ".source-reader" / "vendor"
+        models_dir = self.root / ".source-reader" / "models"
+        model_dir = models_dir / "faster-whisper-medium"
+        if self.dry_run:
+            print(
+                f"\n[dry-run] would install yt-dlp + faster-whisper + ctranslate2 into "
+                f"{vendor_dir.relative_to(self.root)}"
+            )
+            print(
+                f"[dry-run] would download Whisper medium model (~769MB) to "
+                f"{model_dir.relative_to(self.root)}"
+            )
+            self._print_ffmpeg_hint()
+            return
+        self.install_yt_dlp()
+        vendor_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\ninstalling faster-whisper + ctranslate2 into {vendor_dir.relative_to(self.root)}...")
+        # Install faster-whisper with --no-deps to avoid onnxruntime (no cp314 wheel)
+        # and av (requires source build). The three deps below are all that WhisperModel needs.
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--target",
+                str(vendor_dir),
+                "--no-deps",
+                "faster-whisper==1.2.1",
+            ],
+            cwd=self.root,
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--target",
+                str(vendor_dir),
+                "ctranslate2",
+                "tokenizers>=0.13",
+                "huggingface-hub>=0.21",
+                "tqdm",
+                "av",
+            ],
+            cwd=self.root,
+            check=True,
+        )
+        model_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\ndownloading Whisper medium model (~769MB) to {model_dir.relative_to(self.root)}...")
+        env = os.environ.copy()
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = str(vendor_dir) if not existing else f"{vendor_dir}{os.pathsep}{existing}"
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                f"import sys; sys.path.insert(0, {str(vendor_dir)!r}); "
+                "from huggingface_hub import snapshot_download; "
+                "snapshot_download("
+                "repo_id='Systran/faster-whisper-medium', "
+                f"local_dir={str(model_dir)!r}"
+                "); "
+                f"print('model ready at {model_dir}')",
+            ],
+            env=env,
+            cwd=self.root,
+            check=True,
+        )
+        self._print_ffmpeg_hint()
+
     @staticmethod
     def scrapling_installed() -> bool:
         import importlib.util
@@ -142,6 +241,21 @@ class Installer:
         if shutil.which("yt-dlp"):
             return "installed (PATH)"
         return "not installed (run --install-yt-dlp for video transcripts)"
+
+    def whisper_status(self) -> str:
+        vendor_dir = self.root / ".source-reader" / "vendor"
+        model_dir = self.root / ".source-reader" / "models" / "faster-whisper-medium"
+        whisper_pkg = vendor_dir / "faster_whisper"
+        if not whisper_pkg.exists():
+            return "not installed (run --install-video for video audio transcription)"
+        parts = ["installed"]
+        if model_dir.exists() and any(model_dir.iterdir()):
+            parts.append(f"model: {model_dir.relative_to(self.root)}")
+        else:
+            parts.append("model: not downloaded (run --install-video)")
+        ffmpeg = shutil.which("ffmpeg")
+        parts.append(f"ffmpeg: {ffmpeg or 'not found'}")
+        return " | ".join(parts)
 
     def service_pid_path(self) -> pathlib.Path:
         return self.root / ".source-reader" / "source-reader.pid"
@@ -328,6 +442,7 @@ class Installer:
         scrapling_status = "installed" if self.scrapling_installed() else "not installed (run --install-scrapling for anti-bot support)"
         print(f"Scrapling: {scrapling_status}")
         print(f"yt-dlp: {self.yt_dlp_status()}")
+        print(f"Whisper: {self.whisper_status()}")
         print(
             "\n[security] .source-reader/profiles/ 含登录态等敏感凭据，"
             "禁止提交 Git、禁止分享项目目录给他人。"
@@ -345,6 +460,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--install-scrapling", action="store_true", help="install Scrapling + Camoufox anti-bot fetcher (one-time, ~200MB)")
     parser.add_argument("--no-scrapling", action="store_true", help="skip Scrapling even when --install-mcp implies it")
     parser.add_argument("--install-yt-dlp", action="store_true", help="install project-local yt-dlp into .source-reader/vendor for video subtitles")
+    parser.add_argument(
+        "--install-video",
+        action="store_true",
+        help="install yt-dlp + faster-whisper + download medium model for video audio transcription",
+    )
     parser.add_argument("--install-runtime", action="store_true", help="DEPRECATED: equivalent to --install-core --install-browser; will be removed")
     parser.add_argument("--start-service", action="store_true", help="start local source-reader service after setup")
     parser.add_argument("--install-mcp", action="store_true", help="write project-local MCP config snippets")
@@ -385,6 +505,8 @@ def main(argv: list[str]) -> int:
         installer.install_scrapling()
     if args.install_yt_dlp:
         installer.install_yt_dlp()
+    if args.install_video:
+        installer.install_video()
     if args.register_mcp != "none":
         installer.register_mcp(args.register_mcp)
     if args.start_service:

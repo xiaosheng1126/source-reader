@@ -234,5 +234,219 @@ class UtilsTests(unittest.TestCase):
         self.assertEqual(result, "a\n\nb")
 
 
+class OptionalDepsTests(unittest.TestCase):
+    def test_yt_dlp_status_returns_required_keys(self) -> None:
+        from reader_core.optional import yt_dlp_status
+
+        status = yt_dlp_status()
+        self.assertIn("installed", status)
+        self.assertIn("source", status)
+        self.assertIn("version", status)
+        self.assertIn("vendor_dir", status)
+
+    def test_whisper_status_returns_required_keys(self) -> None:
+        from reader_core.optional import whisper_status
+
+        status = whisper_status()
+        self.assertIn("installed", status)
+        self.assertIn("model_ready", status)
+        self.assertIn("ffmpeg", status)
+
+    def test_whisper_vendor_installed_is_bool(self) -> None:
+        from reader_core.optional import whisper_vendor_installed
+
+        self.assertIsInstance(whisper_vendor_installed(), bool)
+
+    def test_whisper_model_path_none_when_not_downloaded(self) -> None:
+        from reader_core.optional import MODELS_DIR, whisper_model_path
+
+        if not (MODELS_DIR / "faster-whisper-medium").exists():
+            self.assertIsNone(whisper_model_path())
+
+    def test_ffmpeg_path_returns_str_or_none(self) -> None:
+        from reader_core.optional import ffmpeg_path
+
+        result = ffmpeg_path()
+        self.assertTrue(result is None or isinstance(result, str))
+
+    def test_playwright_status_returns_required_keys(self) -> None:
+        from reader_core.optional import playwright_status
+
+        status = playwright_status()
+        self.assertIn("installed", status)
+        self.assertIn("version", status)
+
+    def test_scrapling_installed_is_bool(self) -> None:
+        from reader_core.optional import scrapling_installed
+
+        self.assertIsInstance(scrapling_installed(), bool)
+
+
+class MediaTests(unittest.TestCase):
+    def test_matches_video_host_includes_douyin_and_bilibili_subdomains(self) -> None:
+        from reader_core.media import matches_video_host
+
+        self.assertTrue(matches_video_host("v.douyin.com"))
+        self.assertTrue(matches_video_host("m.douyin.com"))
+        self.assertTrue(matches_video_host("m.bilibili.com"))
+
+    def test_read_video_partial_when_no_yt_dlp(self) -> None:
+        from unittest.mock import patch
+
+        from reader_core.media import read_video
+
+        with patch("reader_core.media.resolve_yt_dlp_command", return_value=None):
+            result = read_video("https://www.youtube.com/watch?v=test", 6000)
+        self.assertEqual(result.read_quality, "partial")
+        self.assertEqual(result.strategy, "video_metadata_stub_no_yt_dlp")
+        self.assertIn("yt-dlp not found", result.errors)
+
+    def test_read_video_partial_when_no_subtitle_and_no_whisper(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from reader_core.media import read_video
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = ""
+        mock_proc.stderr = ""
+        mock_proc.returncode = 0
+        with patch("reader_core.media.resolve_yt_dlp_command", return_value=(["yt-dlp"], None, "path")), patch(
+            "reader_core.media.subprocess.run",
+            return_value=mock_proc,
+        ), patch("reader_core.media.whisper_vendor_installed", return_value=False):
+            result = read_video("https://www.youtube.com/watch?v=test", 6000)
+        self.assertEqual(result.read_quality, "partial")
+        self.assertIn("whisper not installed", result.errors)
+
+    def test_vtt_to_text_strips_metadata(self) -> None:
+        from reader_core.media import vtt_to_text
+
+        vtt = """WEBVTT
+
+00:00:01.000 --> 00:00:03.000
+Hello world
+
+00:00:03.000 --> 00:00:05.000
+Hello world
+
+00:00:05.000 --> 00:00:07.000
+Second line
+"""
+        result = vtt_to_text(vtt)
+        self.assertNotIn("WEBVTT", result)
+        self.assertNotIn("-->", result)
+        self.assertIn("Hello world", result)
+        self.assertIn("Second line", result)
+        self.assertEqual(result.count("Hello world"), 1)
+
+
+class WhisperTranscribeTests(unittest.TestCase):
+    def test_exits_1_when_faster_whisper_missing(self) -> None:
+        import subprocess as _sp
+
+        result = _sp.run(
+            [
+                sys.executable,
+                "scripts/whisper_transcribe.py",
+                "--audio",
+                "nonexistent.mp3",
+                "--model-dir",
+                "/tmp/nomodel",
+                "--output",
+                "/tmp/out.txt",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_exits_1_without_required_args(self) -> None:
+        import subprocess as _sp
+
+        result = _sp.run(
+            [sys.executable, "scripts/whisper_transcribe.py"],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+
+class StatusWhisperTests(unittest.TestCase):
+    def test_gather_status_includes_whisper_key(self) -> None:
+        report = source_reader.gather_status(recent_limit=0)
+        self.assertIn("whisper", report)
+        whisper = report["whisper"]
+        self.assertIn("installed", whisper)
+        self.assertIn("model_ready", whisper)
+        self.assertIn("ffmpeg", whisper)
+
+    def test_status_markdown_includes_whisper_section(self) -> None:
+        report = source_reader.gather_status(recent_limit=0)
+        md = source_reader.status_to_markdown(report)
+        self.assertIn("## Whisper", md)
+        self.assertIn("Installed:", md)
+
+    def test_build_next_actions_includes_install_video_when_whisper_missing(self) -> None:
+        result = source_reader.ReaderOutput(
+            input_type="url",
+            source_type="video",
+            title="https://www.youtube.com/watch?v=x",
+            read_quality="partial",
+            strategy="video_subtitle_attempt",
+            token_policy="max_chars=6000; full_within_budget",
+            content="",
+            errors=["subtitle not found", "whisper not installed"],
+        )
+        actions = source_reader.build_next_actions(
+            result,
+            "https://www.youtube.com/watch?v=x",
+            "fast",
+            ".source-reader/profiles/default",
+            False,
+            False,
+            180000,
+        )
+        action_ids = [action["id"] for action in actions]
+        self.assertIn("install_video", action_ids)
+
+
+class InstallVideoTests(unittest.TestCase):
+    def test_install_video_flag_parseable(self) -> None:
+        import scripts.install as install_mod
+
+        args = install_mod.parse_args(["--install-video", "--dry-run"])
+        self.assertTrue(args.install_video)
+        self.assertTrue(args.dry_run)
+
+    def test_install_video_dry_run_prints_plan(self) -> None:
+        import contextlib
+        import io
+
+        import scripts.install as install_mod
+
+        installer = install_mod.Installer(root=ROOT, force=False, dry_run=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            installer.install_video()
+        output = buf.getvalue()
+        self.assertIn("faster-whisper", output)
+        self.assertIn("dry-run", output)
+
+    def test_whisper_status_string_not_installed(self) -> None:
+        from unittest.mock import patch
+
+        import scripts.install as install_mod
+
+        installer = install_mod.Installer(root=ROOT, force=False, dry_run=False)
+        with patch(
+            "scripts.install.Installer.whisper_status",
+            return_value="not installed (run --install-video for video audio transcription)",
+        ):
+            status = installer.whisper_status()
+        self.assertIn("--install-video", status)
+
+
 if __name__ == "__main__":
     unittest.main()

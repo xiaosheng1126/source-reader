@@ -19,7 +19,6 @@ import pathlib
 import re
 import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,7 +39,6 @@ DEFAULT_SERVICE_PORT = 8765
 SERVICE_PID_PATH = ROOT_DIR / ".source-reader" / "source-reader.pid"
 SERVICE_RUNTIME_PATH = ROOT_DIR / ".source-reader" / "mcp" / "source-reader.runtime.json"
 FAILURES_DIR = ROOT_DIR / ".source-reader" / "failures"
-VENDOR_DIR = ROOT_DIR / ".source-reader" / "vendor"
 PROFILE_WARN_DAYS = 14
 PROFILE_CRITICAL_DAYS = 30
 CREDENTIAL_WARNING = (
@@ -62,6 +60,15 @@ from reader_core.detectors import (  # noqa: E402
     looks_like_js_shell,
 )
 from reader_core.models import ReaderOutput
+from reader_core.media import matches_video_host, read_video
+from reader_core.optional import (
+    ffmpeg_path,
+    playwright_installed,
+    playwright_status,
+    scrapling_installed,
+    whisper_status,
+    yt_dlp_status,
+)
 from reader_core.utils import cap_text, normalize_space, normalize_text, token_policy
 
 
@@ -168,62 +175,6 @@ def score_confidence(result: ReaderOutput) -> int:
     if result.errors:
         score -= min(20, 5 * len(result.errors))
     return max(0, min(100, score))
-
-
-def playwright_installed() -> bool:
-    return (ROOT_DIR / "node_modules" / "playwright").exists()
-
-
-def scrapling_installed() -> bool:
-    import importlib.util
-    return importlib.util.find_spec("scrapling") is not None
-
-
-def yt_dlp_vendor_python_installed() -> bool:
-    return (VENDOR_DIR / "yt_dlp").exists()
-
-
-def yt_dlp_vendor_bin() -> pathlib.Path:
-    suffix = ".exe" if os.name == "nt" else ""
-    return VENDOR_DIR / "bin" / f"yt-dlp{suffix}"
-
-
-def yt_dlp_env() -> dict[str, str]:
-    env = os.environ.copy()
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = str(VENDOR_DIR) if not existing else f"{VENDOR_DIR}{os.pathsep}{existing}"
-    return env
-
-
-def resolve_yt_dlp_command() -> tuple[list[str], dict[str, str] | None, str] | None:
-    local_bin = yt_dlp_vendor_bin()
-    if local_bin.exists():
-        return [str(local_bin)], None, "project_vendor_bin"
-    if yt_dlp_vendor_python_installed():
-        return [sys.executable, "-m", "yt_dlp"], yt_dlp_env(), "project_vendor_python"
-    if command_exists("yt-dlp"):
-        return ["yt-dlp"], None, "path"
-    return None
-
-
-def yt_dlp_status() -> dict[str, object]:
-    resolved = resolve_yt_dlp_command()
-    if not resolved:
-        return {
-            "installed": False,
-            "source": "missing",
-            "version": None,
-            "vendor_dir": str(VENDOR_DIR),
-        }
-    command, env, source = resolved
-    ok, output = run_check(command + ["--version"], cwd=ROOT_DIR, env=env)
-    return {
-        "installed": ok,
-        "source": source,
-        "version": output if ok else None,
-        "vendor_dir": str(VENDOR_DIR),
-        "message": "" if ok else output,
-    }
 
 
 def resolve_browser_profile(browser_profile: str) -> tuple[str, bool, bool]:
@@ -421,6 +372,17 @@ def build_next_actions(
                 category="setup",
             ),
         )
+    if any("whisper not installed" in error or "whisper model not found" in error for error in result.errors):
+        actions.insert(
+            0,
+            action(
+                "install_video",
+                "安装 Whisper 视频转写",
+                "安装 faster-whisper 到 .source-reader/vendor，并下载 medium 模型（~769MB），无字幕视频可转写。",
+                command="python3 scripts/install.py --install-video",
+                category="setup",
+            ),
+        )
     if (
         result.read_quality in {"blocked", "failed"}
         and result.metadata.get("auto_upgraded")
@@ -534,6 +496,8 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
 
     scrapling_ok = scrapling_installed()
     yt_dlp = yt_dlp_status()
+    whisper_s = whisper_status()
+    ffmpeg = ffmpeg_path()
     checks = {
         "root": str(ROOT_DIR),
         "node": node_ok,
@@ -542,6 +506,9 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
         "browser_reader": browser_reader.exists(),
         "playwright": playwright_ok,
         "yt_dlp": yt_dlp,
+        "whisper_installed": whisper_s["installed"],
+        "whisper_model_ready": whisper_s["model_ready"],
+        "ffmpeg": ffmpeg or "not found",
         "scrapling": scrapling_ok,
         "browser_profile": profile_path.exists(),
         "browser_profile_path": str(profile_path),
@@ -558,6 +525,11 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
     if not yt_dlp.get("installed"):
         recommendations.append(
             "Video transcript reading requires yt-dlp. Run: python3 scripts/install.py --install-yt-dlp"
+        )
+    if not whisper_s["installed"]:
+        recommendations.append(
+            "Whisper (audio transcription for videos without subtitles) is optional. "
+            "Run: python3 scripts/install.py --install-video"
         )
     if not scrapling_ok:
         recommendations.append(
@@ -925,18 +897,6 @@ def profile_status() -> dict[str, object]:
     }
 
 
-def playwright_status() -> dict[str, object]:
-    installed = playwright_installed()
-    version: str | None = None
-    pkg = ROOT_DIR / "node_modules" / "playwright" / "package.json"
-    if pkg.exists():
-        try:
-            version = json.loads(pkg.read_text(encoding="utf-8")).get("version")
-        except (OSError, json.JSONDecodeError):
-            version = None
-    return {"installed": installed, "version": version}
-
-
 def runtime_status() -> dict[str, object]:
     sr_dir = ROOT_DIR / ".source-reader"
     return {
@@ -956,6 +916,7 @@ def gather_status(recent_limit: int = 10) -> dict[str, object]:
         "recent_failures": recent_failures_from_logs(recent_limit),
         "playwright": playwright_status(),
         "yt_dlp": yt_dlp_status(),
+        "whisper": whisper_status(),
         "runtime": runtime_status(),
     }
 
@@ -965,6 +926,7 @@ def status_to_markdown(report: dict[str, object]) -> str:
     profile = report.get("profile") if isinstance(report.get("profile"), dict) else {}
     playwright = report.get("playwright") if isinstance(report.get("playwright"), dict) else {}
     yt_dlp = report.get("yt_dlp") if isinstance(report.get("yt_dlp"), dict) else {}
+    whisper = report.get("whisper") if isinstance(report.get("whisper"), dict) else {}
     runtime = report.get("runtime") if isinstance(report.get("runtime"), dict) else {}
     recent = report.get("recent_reads") if isinstance(report.get("recent_reads"), list) else []
     recent_failures = report.get("recent_failures") if isinstance(report.get("recent_failures"), list) else []
@@ -1071,6 +1033,13 @@ def status_to_markdown(report: dict[str, object]) -> str:
 - Source: {yt_dlp.get('source') or 'n/a'}
 - Version: {yt_dlp.get('version') or 'n/a'}
 - Vendor dir: {yt_dlp.get('vendor_dir') or 'n/a'}
+
+## Whisper
+
+- Installed: {whisper.get('installed')}
+- Model ready: {whisper.get('model_ready')} ({whisper.get('model_path') or 'n/a'})
+- ffmpeg: {whisper.get('ffmpeg') or 'not found'}
+- Version: {whisper.get('version') or 'n/a'}
 
 ## Runtime
 
@@ -1649,85 +1618,6 @@ def read_github(url: str, max_chars: int) -> ReaderOutput:
     return read_github_repo_readme(owner, repo, url, max_chars)
 
 
-def read_video(url: str, max_chars: int) -> ReaderOutput:
-    resolved = resolve_yt_dlp_command()
-    if not resolved:
-        return ReaderOutput(
-            input_type="url",
-            source_type="video",
-            title=url,
-            url=url,
-            read_quality="partial",
-            strategy="video_metadata_stub_no_yt_dlp",
-            token_policy=token_policy(max_chars, False),
-            content="未安装 yt-dlp，无法自动读取字幕。建议安装后优先读取字幕/章节，而不是下载视频或抓取评论。",
-            errors=["yt-dlp not found"],
-        )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        yt_dlp_cmd, yt_dlp_run_env, yt_dlp_source = resolved
-        output_tpl = str(pathlib.Path(tmp) / "subtitle.%(ext)s")
-        cmd = [
-            *yt_dlp_cmd,
-            "--skip-download",
-            "--write-auto-subs",
-            "--write-subs",
-            "--sub-langs",
-            "zh-CN,zh-Hans,zh,en.*",
-            "--sub-format",
-            "vtt",
-            "--output",
-            output_tpl,
-            "--print",
-            "title",
-            url,
-        ]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=yt_dlp_run_env, text=True, timeout=90)
-        title = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else url
-        subtitle_files = sorted(pathlib.Path(tmp).glob("*.vtt"))
-        if not subtitle_files:
-            return ReaderOutput(
-                input_type="url",
-                source_type="video",
-                title=title,
-                url=url,
-                read_quality="partial",
-                strategy="video_subtitle_attempt",
-                token_policy=token_policy(max_chars, False),
-                content="没有找到可用字幕。不要读取整段音视频；下一步应人工提供字幕或开启转写。",
-                metadata={"yt_dlp_source": yt_dlp_source},
-                errors=[proc.stderr.strip()[-1000:] if proc.stderr else "subtitle not found"],
-            )
-        text = vtt_to_text(subtitle_files[0].read_text(encoding="utf-8", errors="replace"))
-        content, clipped = cap_text(text, max_chars)
-        return ReaderOutput(
-            input_type="url",
-            source_type="video",
-            title=title,
-            url=url,
-            read_quality="transcript",
-            strategy="video_subtitles_only",
-            token_policy=token_policy(max_chars, clipped),
-            content=content,
-            metadata={"subtitle_file": subtitle_files[0].name, "yt_dlp_source": yt_dlp_source},
-        )
-
-
-def vtt_to_text(text: str) -> str:
-    lines: list[str] = []
-    previous = ""
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line == "WEBVTT" or "-->" in line or re.match(r"^\d+$", line):
-            continue
-        line = re.sub(r"<[^>]+>", "", line)
-        line = normalize_space(line)
-        if line and line != previous:
-            lines.append(line)
-            previous = line
-    return normalize_text("\n".join(lines))
-
-
 def read_discussion(url: str, max_chars: int) -> ReaderOutput:
     result = read_basic_url(url, max_chars)
     result.source_type = "discussion"
@@ -1934,7 +1824,7 @@ def classify_and_read(
         path = parsed.path.lower()
         if host in {"github.com", "gist.github.com"}:
             result = read_github(source, max_chars)
-        elif "youtube.com" in host or "youtu.be" in host or "bilibili.com" in host:
+        elif matches_video_host(host):
             result = read_video(source, max_chars)
         elif host in {"news.ycombinator.com", "www.reddit.com", "reddit.com", "v2ex.com", "www.v2ex.com"} or host.endswith(".reddit.com"):
             result = read_discussion(source, max_chars)
