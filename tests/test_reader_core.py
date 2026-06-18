@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 import tempfile
@@ -210,6 +211,754 @@ class ActionPolicyTests(unittest.TestCase):
         )
         self.assertIn("read --feedback bad --run-id run-1", str(feedback_commands["mark_result_bad"]))
 
+    def test_build_next_actions_offers_jina_for_partial_public_webpage(self) -> None:
+        result = source_reader.ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title="Example",
+            read_quality="partial",
+            strategy="html_text_extraction",
+            token_policy="max_chars=6000; full_within_budget",
+            content="",
+            metadata={"maybe_js_rendered": True},
+            errors=["Page looks like a JavaScript-rendered shell."],
+        )
+        actions = source_reader.build_next_actions(
+            result,
+            "https://example.com/a",
+            "fast",
+            ".source-reader/profiles/default",
+            False,
+            False,
+            180000,
+        )
+        self.assertEqual(actions[0]["id"], "read_with_jina")
+        self.assertEqual(actions[0]["category"], "external")
+        self.assertEqual(actions[0]["adapter"], "jina_reader")
+
+
+class BackendRoutingTests(unittest.TestCase):
+    def test_backend_registry_orders_candidates_by_priority(self) -> None:
+        from reader_core.backends import BackendRegistry, FunctionBackend, ReadContext
+        from reader_core.models import ReaderOutput
+
+        def _reader(context: ReadContext) -> ReaderOutput:
+            return ReaderOutput(
+                input_type="url",
+                source_type="webpage",
+                title=context.source,
+            )
+
+        registry = BackendRegistry()
+        registry.register(FunctionBackend("late", 20, lambda _source, _mode: True, _reader))
+        registry.register(FunctionBackend("early", 10, lambda _source, _mode: True, _reader))
+
+        self.assertEqual(
+            [backend.id for backend in registry.candidates("https://example.com", "fast")],
+            ["early", "late"],
+        )
+
+    def test_source_reader_routes_local_file_to_local_backend(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tmp:
+            tmp.write("hello backend routing")
+            tmp_path = pathlib.Path(tmp.name)
+        try:
+            result = source_reader.classify_and_read(str(tmp_path), read_depth="preview")
+            self.assertEqual(result.metadata.get("backend_id"), "local_file")
+            self.assertEqual(result.strategy, "local_text_file")
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def test_source_reader_routes_github_url_to_github_backend(self) -> None:
+        candidates = source_reader.BACKEND_REGISTRY.candidates(
+            "https://github.com/Panniantong/Agent-Reach",
+            "fast",
+        )
+        self.assertGreater(len(candidates), 0)
+        self.assertEqual(candidates[0].id, "github")
+
+    def test_github_standard_repo_read_keeps_readme_only(self) -> None:
+        calls: list[str] = []
+        original_request_url = source_reader.request_url
+
+        def fake_request_url(url: str):
+            calls.append(url)
+            if "api.github.com" in url:
+                raise AssertionError("standard read should not call GitHub API")
+            if url.endswith("/README.md"):
+                return b"# Tool\n\nREADME only", "text/plain", url
+            raise RuntimeError("not found")
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://github.com/acme/tool",
+                read_depth="standard",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(result.strategy, "github_repo_readme_only")
+        self.assertEqual(result.metadata.get("backend_id"), "github")
+        self.assertIn("README only", result.content)
+        self.assertFalse(any("api.github.com" in url for url in calls))
+
+    def test_github_full_repo_read_selects_docs_and_manifests(self) -> None:
+        original_request_url = source_reader.request_url
+
+        def fake_json(payload: object, url: str):
+            return json.dumps(payload).encode("utf-8"), "application/json", url
+
+        def fake_request_url(url: str):
+            if url == "https://api.github.com/repos/acme/tool":
+                return fake_json({"default_branch": "main"}, url)
+            if url == "https://api.github.com/repos/acme/tool/git/trees/main?recursive=1":
+                return fake_json(
+                    {
+                        "truncated": False,
+                        "tree": [
+                            {"type": "blob", "path": "README.md"},
+                            {"type": "blob", "path": "docs/install.md"},
+                            {"type": "blob", "path": "package.json"},
+                            {"type": "blob", "path": "src/app.py"},
+                        ],
+                    },
+                    url,
+                )
+            if url.endswith("/README.md"):
+                return b"# Tool\n\nOverview", "text/plain", url
+            if url.endswith("/docs/install.md"):
+                return b"# Install\n\nUsage details", "text/plain", url
+            if url.endswith("/package.json"):
+                return b'{"name":"tool"}', "application/json", url
+            raise RuntimeError(f"unexpected url: {url}")
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://github.com/acme/tool",
+                read_depth="full",
+                max_chars=6000,
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(result.strategy, "github_repo_selected_docs_and_manifests")
+        self.assertEqual(result.metadata.get("backend_id"), "github")
+        self.assertEqual(result.metadata.get("files_read"), 3)
+        self.assertEqual(result.metadata.get("paths"), ["README.md", "docs/install.md", "package.json"])
+        self.assertIn("## README.md", result.content)
+        self.assertIn("## docs/install.md", result.content)
+        self.assertIn("## package.json", result.content)
+        self.assertNotIn("src/app.py", result.content)
+
+    def test_source_reader_routes_feed_url_to_feed_backend(self) -> None:
+        candidates = source_reader.BACKEND_REGISTRY.candidates(
+            "https://example.com/feed.xml",
+            "fast",
+        )
+        self.assertGreater(len(candidates), 0)
+        self.assertEqual(candidates[0].id, "feed")
+
+    def test_feed_backend_reads_rss_items(self) -> None:
+        original_request_url = source_reader.request_url
+
+        def fake_request_url(url: str):
+            body = b"""<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title>Example Feed</title>
+    <description>Updates</description>
+    <item>
+      <title>First Post</title>
+      <link>https://example.com/first</link>
+      <pubDate>Fri, 19 Jun 2026 00:00:00 GMT</pubDate>
+      <description>First summary</description>
+    </item>
+  </channel>
+</rss>"""
+            return body, "application/rss+xml; charset=utf-8", url
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/feed.xml",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(result.strategy, "feed_items_summary")
+        self.assertEqual(result.metadata.get("backend_id"), "feed")
+        self.assertEqual(result.metadata.get("items_read"), 1)
+        self.assertIn("# Example Feed", result.content)
+        self.assertIn("First Post", result.content)
+        self.assertIn("https://example.com/first", result.content)
+
+    def test_feed_backend_reads_atom_link_href(self) -> None:
+        original_request_url = source_reader.request_url
+
+        def fake_request_url(url: str):
+            body = b"""<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Atom Feed</title>
+  <entry>
+    <title>Atom Entry</title>
+    <link href="https://example.com/atom-entry" />
+    <updated>2026-06-19T00:00:00Z</updated>
+    <summary>Atom summary</summary>
+  </entry>
+</feed>"""
+            return body, "application/atom+xml", url
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/atom",
+                read_depth="standard",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(result.strategy, "feed_items_summary")
+        self.assertEqual(result.metadata.get("feed_type"), "feed")
+        self.assertIn("Atom Entry", result.content)
+        self.assertIn("https://example.com/atom-entry", result.content)
+
+    def test_jina_reader_action_uses_external_reader_url(self) -> None:
+        calls: list[str] = []
+        original_request_url = source_reader.request_url
+
+        def fake_request_url(url: str):
+            calls.append(url)
+            return b"Title: Example\n\nMarkdown content", "text/plain", url
+
+        source_reader.request_url = fake_request_url
+        try:
+            read_depth, focus = source_reader.action_read_depth("read_with_jina")
+            result = source_reader.classify_and_read(
+                "https://example.com/a",
+                mode="jina",
+                read_depth=read_depth,
+                max_chars=6000,
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(focus, "jina")
+        self.assertEqual(calls, ["https://r.jina.ai/https://example.com/a"])
+        self.assertEqual(result.strategy, "jina_reader_markdown")
+        self.assertEqual(result.metadata.get("backend_id"), "jina_reader")
+        self.assertEqual(result.metadata.get("external_service"), "jina_reader")
+        self.assertIn("Markdown content", result.content)
+
+
+class WebExtractionTests(unittest.TestCase):
+    def test_extract_html_prefers_article_region(self) -> None:
+        html = """
+<html>
+  <head><title>Example</title></head>
+  <body>
+    <nav>Home Pricing Login Docs</nav>
+    <article>
+      <h1>Real Article</h1>
+      <p>This is the article body with enough detail to be selected as the preferred region.</p>
+      <p>It should not be polluted by the surrounding navigation links.</p>
+    </article>
+  </body>
+</html>
+"""
+        title, content, metadata = source_reader.extract_html_details(html)
+
+        self.assertEqual(title, "Example")
+        self.assertIn("Real Article", content)
+        self.assertNotIn("Home Pricing Login Docs", content)
+        self.assertEqual(metadata.get("html_preferred_region"), "article_or_main")
+
+    def test_read_basic_url_exposes_meta_and_json_ld(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html lang="zh-CN">
+  <head>
+    <title>Fallback Title</title>
+    <meta property="og:title" content="OpenGraph Title">
+    <meta property="og:site_name" content="Example Site">
+    <meta property="og:image" content="https://example.com/cover.jpg">
+    <meta property="article:modified_time" content="2026-06-20T08:00:00Z">
+    <meta name="description" content="Short page description">
+    <link rel="canonical" href="https://example.com/canonical">
+    <script type="application/ld+json">
+      {
+        "@type": "Article",
+        "headline": "Structured Headline",
+        "datePublished": "2026-06-19",
+        "author": {"name": "Andy"}
+      }
+    </script>
+  </head>
+  <body>
+    <main>
+      <h1>Structured Headline</h1>
+      <p>This article body has enough words to trigger preferred extraction and keep the useful page content.</p>
+      <p>The parser should retain this content while exposing structured metadata for callers.</p>
+    </main>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", url
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/article",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(result.metadata.get("backend_id"), "fast_web")
+        self.assertEqual(result.title, "OpenGraph Title")
+        self.assertEqual(result.metadata.get("html_title"), "Fallback Title")
+        self.assertEqual(result.metadata.get("html_meta_title"), "OpenGraph Title")
+        self.assertEqual(result.metadata.get("html_description"), "Short page description")
+        self.assertEqual(result.metadata.get("html_canonical_url"), "https://example.com/canonical")
+        self.assertEqual(result.metadata.get("html_site_name"), "Example Site")
+        self.assertEqual(result.metadata.get("html_preview_image"), "https://example.com/cover.jpg")
+        self.assertEqual(result.metadata.get("html_language"), "zh-CN")
+        self.assertEqual(result.metadata.get("html_modified_at"), "2026-06-20T08:00:00Z")
+        self.assertEqual(result.metadata.get("json_ld", {}).get("headline"), "Structured Headline")
+        self.assertEqual(result.published_at, "2026-06-19")
+        self.assertEqual(result.author, "Andy")
+
+    def test_read_basic_url_resolves_relative_metadata_urls(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html>
+  <head>
+    <title>Relative URLs</title>
+    <base href="https://cdn.example.com/site/articles/current/">
+    <meta property="og:image" content="/assets/cover.jpg">
+    <link rel="canonical" href="../canonical">
+  </head>
+  <body>
+    <article>
+      <h1>Relative URLs</h1>
+      <p>This body is long enough to keep the preferred article extraction path active for the page.</p>
+      <p>The metadata URL resolver should use the final response URL as the base URL.</p>
+    </article>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", "https://example.com/articles/current/page"
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/redirect",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(result.metadata.get("html_base_url"), "https://cdn.example.com/site/articles/current/")
+        self.assertEqual(result.metadata.get("html_canonical_url"), "https://cdn.example.com/site/articles/canonical")
+        self.assertEqual(result.metadata.get("html_preview_image"), "https://cdn.example.com/assets/cover.jpg")
+
+    def test_read_basic_url_exposes_main_content_links(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html>
+  <head><title>Linked Article</title></head>
+  <body>
+    <nav><a href="/login">Login</a></nav>
+    <main>
+      <h1>Linked Article</h1>
+      <p>This article body is long enough to keep the preferred region active for extraction.</p>
+      <p>Readers can continue with the <a href="../guide">complete guide</a> or inspect
+      <a href="https://example.com/reference">reference docs</a>.</p>
+      <p><a href="mailto:hi@example.com">Email us</a> <a href="javascript:void(0)">Run script</a></p>
+    </main>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", "https://example.com/articles/current/page"
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/redirect",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(
+            result.metadata.get("html_links"),
+            [
+                {"text": "complete guide", "url": "https://example.com/articles/guide"},
+                {"text": "reference docs", "url": "https://example.com/reference"},
+            ],
+        )
+
+    def test_read_basic_url_exposes_main_content_headings(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html>
+  <head><title>Heading Article</title></head>
+  <body>
+    <aside><h2>Navigation Heading</h2></aside>
+    <main>
+      <h1>Heading Article</h1>
+      <p>This article body is long enough to keep the preferred region active for extraction.</p>
+      <h2>Backend <a href="/routing">Routing</a></h2>
+      <p>The parser should preserve headings as structured metadata for downstream agents.</p>
+      <h3>Fallbacks</h3>
+    </main>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", "https://example.com/articles/current/page"
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/redirect",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(
+            result.metadata.get("html_headings"),
+            [
+                {"level": 1, "text": "Heading Article"},
+                {"level": 2, "text": "Backend Routing"},
+                {"level": 3, "text": "Fallbacks"},
+            ],
+        )
+
+    def test_read_basic_url_exposes_main_content_images(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html>
+  <head><title>Image Article</title></head>
+  <body>
+    <header><img src="/logo.png" alt="Site logo"></header>
+    <article>
+      <h1>Image Article</h1>
+      <p>This article body is long enough to keep the preferred region active for extraction.</p>
+      <img src="../images/diagram.png" alt="System diagram">
+      <img data-src="https://cdn.example.com/photo.jpg">
+      <img src="data:image/png;base64,abc" alt="Inline">
+      <p>The parser should expose useful article images without fetching binary assets.</p>
+    </article>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", "https://example.com/articles/current/page"
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/redirect",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(
+            result.metadata.get("html_images"),
+            [
+                {"url": "https://example.com/articles/images/diagram.png", "alt": "System diagram"},
+                {"url": "https://cdn.example.com/photo.jpg"},
+            ],
+        )
+
+    def test_read_basic_url_uses_srcset_for_main_content_images(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html>
+  <head><title>Srcset Article</title></head>
+  <body>
+    <article>
+      <h1>Srcset Article</h1>
+      <p>This article body is long enough to keep the preferred region active for extraction.</p>
+      <img srcset="../small.jpg 640w, ../large.jpg 1280w" alt="Responsive diagram">
+      <p>The parser should keep the most useful responsive image candidate for downstream agents.</p>
+    </article>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", "https://example.com/articles/current/page"
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/redirect",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(
+            result.metadata.get("html_images"),
+            [{"url": "https://example.com/articles/large.jpg", "alt": "Responsive diagram"}],
+        )
+
+    def test_read_basic_url_exposes_figure_captions_for_images(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html>
+  <head><title>Figure Article</title></head>
+  <body>
+    <article>
+      <h1>Figure Article</h1>
+      <p>This article body is long enough to keep the preferred region active for extraction.</p>
+      <figure>
+        <img src="../images/architecture.png" alt="Architecture diagram">
+        <figcaption>Architecture overview with request routing and fallback readers.</figcaption>
+      </figure>
+      <p>The parser should preserve figure captions as image metadata for downstream agents.</p>
+    </article>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", "https://example.com/articles/current/page"
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/redirect",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(
+            result.metadata.get("html_images"),
+            [
+                {
+                    "url": "https://example.com/articles/images/architecture.png",
+                    "alt": "Architecture diagram",
+                    "caption": "Architecture overview with request routing and fallback readers.",
+                }
+            ],
+        )
+
+    def test_read_basic_url_exposes_main_content_tables(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html>
+  <head><title>Table Article</title></head>
+  <body>
+    <article>
+      <h1>Table Article</h1>
+      <p>This article body is long enough to keep the preferred region active for extraction.</p>
+      <table>
+        <caption>Reader backend comparison</caption>
+        <tr><th>Backend</th><th>Use case</th></tr>
+        <tr><td>fast_web</td><td>Static pages</td></tr>
+        <tr><td>browser_web</td><td>Logged-in pages</td></tr>
+      </table>
+      <p>The parser should preserve compact table structure for downstream agents.</p>
+    </article>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", "https://example.com/articles/current/page"
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/redirect",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(
+            result.metadata.get("html_tables"),
+            [
+                {
+                    "caption": "Reader backend comparison",
+                    "rows": [
+                        ["Backend", "Use case"],
+                        ["fast_web", "Static pages"],
+                        ["browser_web", "Logged-in pages"],
+                    ],
+                }
+            ],
+        )
+
+    def test_read_basic_url_ignores_tables_outside_main_content(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html>
+  <head><title>Navigation Table</title></head>
+  <body>
+    <aside>
+      <table><tr><td>Navigation</td></tr></table>
+    </aside>
+    <main>
+      <h1>Navigation Table</h1>
+      <p>This body is long enough to keep the preferred region active for extraction.</p>
+      <p>The parser should avoid collecting layout tables outside the preferred region.</p>
+    </main>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", "https://example.com/articles/current/page"
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/redirect",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertNotIn("html_tables", result.metadata)
+
+    def test_read_basic_url_uses_html_meta_author_and_published_at(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html>
+  <head>
+    <title>Meta Article</title>
+    <meta name="author" content="Meta Author">
+    <meta property="article:published_time" content="2026-06-18T10:00:00Z">
+  </head>
+  <body>
+    <article>
+      <h1>Meta Article</h1>
+      <p>This article body has enough words to use the preferred region and avoid unrelated chrome.</p>
+      <p>The metadata fallback should populate author and publication time without JSON-LD.</p>
+    </article>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", url
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/meta-article",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        self.assertEqual(result.title, "Meta Article")
+        self.assertEqual(result.metadata.get("html_author"), "Meta Author")
+        self.assertEqual(result.metadata.get("html_published_at"), "2026-06-18T10:00:00Z")
+        self.assertEqual(result.author, "Meta Author")
+        self.assertEqual(result.published_at, "2026-06-18T10:00:00Z")
+
+    def test_read_basic_url_exposes_richer_meta_and_json_ld(self) -> None:
+        original_request_url = source_reader.request_url
+        html = b"""
+<html>
+  <head>
+    <title>Rich Article</title>
+    <meta name="keywords" content="AI, Reader">
+    <meta property="article:tag" content="Web Extraction">
+    <script type="application/ld+json">
+      {
+        "@type": "TechArticle",
+        "headline": "Rich Article",
+        "description": "Structured description",
+        "datePublished": "2026-06-19",
+        "dateModified": "2026-06-20",
+        "author": {"name": "Andy"},
+        "url": "/articles/rich",
+        "image": "/images/rich.jpg",
+        "articleSection": "Engineering",
+        "keywords": ["AI", "Reading"]
+      }
+    </script>
+  </head>
+  <body>
+    <article>
+      <h1>Rich Article</h1>
+      <p>This article body is long enough to activate the preferred content region for extraction.</p>
+      <p>The parser should expose richer metadata without adding extra network requests.</p>
+    </article>
+  </body>
+</html>
+"""
+
+        def fake_request_url(url: str):
+            return html, "text/html; charset=utf-8", "https://example.com/docs/page"
+
+        source_reader.request_url = fake_request_url
+        try:
+            result = source_reader.classify_and_read(
+                "https://example.com/docs/page",
+                read_depth="preview",
+            )
+        finally:
+            source_reader.request_url = original_request_url
+
+        json_ld = result.metadata.get("json_ld", {})
+        self.assertEqual(result.metadata.get("html_tags"), ["AI", "Reader", "Web Extraction"])
+        self.assertEqual(result.metadata.get("html_canonical_url"), "https://example.com/articles/rich")
+        self.assertEqual(result.metadata.get("html_preview_image"), "https://example.com/images/rich.jpg")
+        self.assertEqual(json_ld.get("description"), "Structured description")
+        self.assertEqual(json_ld.get("modified_at"), "2026-06-20")
+        self.assertEqual(json_ld.get("section"), "Engineering")
+        self.assertEqual(json_ld.get("keywords"), ["AI", "Reading"])
+
+    def test_json_ld_summary_prefers_article_node_in_graph(self) -> None:
+        summary = source_reader._json_ld_summary(
+            [
+                """
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "name": "Example Site",
+      "url": "https://example.com"
+    },
+    {
+      "@type": "Article",
+      "headline": "Actual Article",
+      "datePublished": "2026-06-19",
+      "author": {"name": "Andy"},
+      "image": "https://example.com/article.jpg"
+    }
+  ]
+}
+"""
+            ]
+        )
+
+        self.assertEqual(summary.get("type"), "Article")
+        self.assertEqual(summary.get("headline"), "Actual Article")
+        self.assertEqual(summary.get("published_at"), "2026-06-19")
+        self.assertEqual(summary.get("author"), "Andy")
+
 
 class FailureLogTests(unittest.TestCase):
     def test_failed_result_writes_failure_log(self) -> None:
@@ -259,20 +1008,20 @@ class FailureLogTests(unittest.TestCase):
         ]
         suggestions = source_reader.failure_suggestions(failures)
         self.assertEqual(suggestions[0]["domain"], "example.com")
-        self.assertEqual(suggestions[0]["error_type"], "js_shell")
+        self.assertEqual(suggestions[0]["failure_type"], "js_shell")
         self.assertEqual(suggestions[0]["count"], 2)
 
     def test_classify_failure_type_detects_pdf_no_text(self) -> None:
         result = source_reader.classify_failure_type({}, ["pdf has no extractable text"], "local_pdf_no_extractable_text")
-        self.assertEqual(result, "pdf_no_text")
+        self.assertEqual(result, "unknown")
 
     def test_classify_failure_type_detects_broken_yt_dlp_vendor(self) -> None:
         result = source_reader.classify_failure_type({}, ["ModuleNotFoundError: No module named 'yt_dlp'"], "video_audio_download_failed")
-        self.assertEqual(result, "missing_yt_dlp")
+        self.assertEqual(result, "missing_dependency")
 
     def test_classify_failure_type_detects_video_anti_bot(self) -> None:
         result = source_reader.classify_failure_type({}, ["HTTP Error 403: Forbidden"], "video_audio_download_failed")
-        self.assertEqual(result, "anti_bot")
+        self.assertEqual(result, "http_error")
 
 
 class ModelsTests(unittest.TestCase):
@@ -465,6 +1214,27 @@ class WhisperTranscribeTests(unittest.TestCase):
 
 
 class StatusWhisperTests(unittest.TestCase):
+    def test_gather_status_includes_backend_capabilities(self) -> None:
+        report = source_reader.gather_status(recent_limit=0)
+        self.assertIn("backend_capabilities", report)
+        capabilities = report["backend_capabilities"]
+        self.assertIsInstance(capabilities, list)
+        ids = {item.get("id") for item in capabilities if isinstance(item, dict)}
+        self.assertIn("fast_web", ids)
+        self.assertIn("github", ids)
+
+    def test_status_markdown_includes_backend_capabilities_section(self) -> None:
+        report = source_reader.gather_status(recent_limit=0)
+        md = source_reader.status_to_markdown(report)
+        self.assertIn("## Backend Capabilities", md)
+        self.assertIn("fast_web", md)
+
+    def test_doctor_includes_backend_capabilities(self) -> None:
+        report = source_reader.source_reader_doctor()
+        self.assertIn("backend_capabilities", report)
+        md = source_reader.doctor_to_markdown(report)
+        self.assertIn("## Backend Capabilities", md)
+
     def test_gather_status_includes_whisper_key(self) -> None:
         report = source_reader.gather_status(recent_limit=0)
         self.assertIn("whisper", report)
@@ -656,6 +1426,238 @@ class InstallVideoTests(unittest.TestCase):
         ):
             status = installer.whisper_status()
         self.assertIn("--install-video", status)
+
+
+class FailureTypeTests(unittest.TestCase):
+    def test_auth_wall_classified(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {"blocked_by": "auth_wall"}, ["Page requires login"], "html_text_extraction"
+        )
+        self.assertEqual(result, "auth_wall")
+
+    def test_js_shell_classified(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {"maybe_js_rendered": True}, [], "html_text_extraction"
+        )
+        self.assertEqual(result, "js_shell")
+
+    def test_cloudflare_classified(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {"blocked_by": "cloudflare"}, ["cloudflare challenge"], "html_text_extraction"
+        )
+        self.assertEqual(result, "cloudflare_block")
+
+    def test_missing_dependency_yt_dlp(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {}, ["yt-dlp not found"], "video_yt_dlp"
+        )
+        self.assertEqual(result, "missing_dependency")
+
+    def test_missing_dependency_pypdf(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {}, ["pypdf not installed"], "local_pdf"
+        )
+        self.assertEqual(result, "missing_dependency")
+
+    def test_http_error_classified(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {}, ["HTTP request failed: 403"], "html_text_extraction"
+        )
+        self.assertEqual(result, "http_error")
+
+    def test_no_content_classified(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {}, [], "html_text_extraction"
+        )
+        self.assertEqual(result, "no_content")
+
+    def test_unknown_fallback(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {}, ["something completely unexpected"], "html_text_extraction"
+        )
+        self.assertEqual(result, "unknown")
+
+    def test_auth_wall_via_auth_assistance_reason(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {"auth_assistance_reason": "limited_logged_out_view"}, [], "html_text_extraction"
+        )
+        self.assertEqual(result, "auth_wall")
+
+    def test_cloudflare_challenge_solving_failed(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {}, ["challenge solving failed"], "html_text_extraction"
+        )
+        self.assertEqual(result, "cloudflare_block")
+
+    def test_js_shell_priority_over_no_content(self) -> None:
+        from source_reader import classify_failure_type
+        # maybe_js_rendered=True + no errors → should be js_shell not no_content
+        result = classify_failure_type(
+            {"maybe_js_rendered": True}, [], "html_text_extraction"
+        )
+        self.assertEqual(result, "js_shell")
+
+    def test_auth_wall_priority_over_http_error(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {"blocked_by": "auth_wall"}, ["HTTP request failed"], "html_text_extraction"
+        )
+        self.assertEqual(result, "auth_wall")
+
+    def test_url_with_403_not_misclassified(self) -> None:
+        from source_reader import classify_failure_type
+        result = classify_failure_type(
+            {}, ["Failed fetching https://example.com/article/top-403-errors-explained"], "html_text_extraction"
+        )
+        self.assertNotEqual(result, "http_error")
+
+
+class LogGCTests(unittest.TestCase):
+    def _make_logs(self, directory: pathlib.Path, count: int) -> None:
+        import os, time
+        directory.mkdir(parents=True, exist_ok=True)
+        for i in range(count):
+            p = directory / f"run_{i:04d}.json"
+            p.write_text('{"run_id": "x", "recorded_at": "2026-01-01T00:00:00"}')
+            # stagger mtime so sorting is deterministic
+            os.utime(p, (i, i))
+
+    def test_gc_count_mode_trims_to_max(self) -> None:
+        import os
+        from source_reader import _gc_logs
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = pathlib.Path(tmp) / "runs"
+            failures = pathlib.Path(tmp) / "failures"
+            self._make_logs(runs, 10)
+            self._make_logs(failures, 10)
+            _gc_logs(runs, failures, {"mode": "count", "max_runs": 5, "keep_failures": False})
+            self.assertEqual(len(list(runs.glob("*.json"))), 5)
+            self.assertEqual(len(list(failures.glob("*.json"))), 5)
+
+    def test_gc_keep_failures_doubles_limit(self) -> None:
+        import os
+        from source_reader import _gc_logs
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = pathlib.Path(tmp) / "runs"
+            failures = pathlib.Path(tmp) / "failures"
+            self._make_logs(runs, 10)
+            self._make_logs(failures, 20)
+            _gc_logs(runs, failures, {"mode": "count", "max_runs": 5, "keep_failures": True})
+            self.assertEqual(len(list(runs.glob("*.json"))), 5)
+            # keep_failures doubles the limit for failures dir
+            self.assertEqual(len(list(failures.glob("*.json"))), 10)
+
+    def test_gc_days_mode_removes_old(self) -> None:
+        import os, time
+        from source_reader import _gc_logs
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = pathlib.Path(tmp) / "runs"
+            runs.mkdir()
+            old = runs / "old.json"
+            new = runs / "new.json"
+            old.write_text('{"run_id":"old","recorded_at":"2020-01-01T00:00:00"}')
+            new.write_text('{"run_id":"new","recorded_at":"2099-01-01T00:00:00"}')
+            # set mtime: old = 100 days ago, new = now
+            now = time.time()
+            os.utime(old, (now - 100 * 86400, now - 100 * 86400))
+            os.utime(new, (now, now))
+            failures = pathlib.Path(tmp) / "failures"
+            failures.mkdir()
+            _gc_logs(runs, failures, {"mode": "days", "max_days": 30, "keep_failures": False})
+            self.assertFalse(old.exists())
+            self.assertTrue(new.exists())
+
+
+class ReadSummaryTests(unittest.TestCase):
+    def _make_result(self, quality: str, strategy: str = "html", errors=None, metadata=None):
+        from reader_core.models import ReaderOutput
+        return ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title="Test",
+            url="https://example.com",
+            read_quality=quality,
+            strategy=strategy,
+            token_policy="max_chars=6000; full_within_budget",
+            content="hello world " * 100,
+            errors=errors or [],
+            metadata=metadata or {},
+        )
+
+    def test_read_summary_present_in_preview(self) -> None:
+        from source_reader import attach_interaction
+        result = self._make_result("good")
+        result = attach_interaction(result, "https://example.com", "preview", "fast", "", False, False, 180000)
+        self.assertIn("read_summary", result.preview)
+
+    def test_read_summary_blocked_has_failure_type(self) -> None:
+        from source_reader import attach_interaction
+        result = self._make_result("blocked", metadata={"blocked_by": "auth_wall"})
+        result = attach_interaction(result, "https://example.com", "preview", "fast", "", False, False, 180000)
+        summary = result.preview["read_summary"]
+        self.assertEqual(summary["failure_type"], "auth_wall")
+
+    def test_read_summary_good_quality_no_failure_type(self) -> None:
+        from source_reader import attach_interaction
+        result = self._make_result("good")
+        result = attach_interaction(result, "https://example.com", "preview", "fast", "", False, False, 180000)
+        summary = result.preview["read_summary"]
+        self.assertIsNone(summary.get("failure_type"))
+
+    def test_read_summary_token_used_positive(self) -> None:
+        from source_reader import attach_interaction
+        result = self._make_result("good")
+        result = attach_interaction(result, "https://example.com", "preview", "fast", "", False, False, 180000)
+        summary = result.preview["read_summary"]
+        self.assertGreater(summary["token_used"], 0)
+
+
+class FailureTypeSummaryTests(unittest.TestCase):
+    def _make_failures(self) -> list[dict]:
+        return [
+            {"domain": "juejin.cn", "failure_type": "auth_wall"},
+            {"domain": "juejin.cn", "failure_type": "auth_wall"},
+            {"domain": "juejin.cn", "failure_type": "auth_wall"},
+            {"domain": "x.com",     "failure_type": "auth_wall"},
+            {"domain": "x.com",     "failure_type": "auth_wall"},
+            {"domain": "notion.so", "failure_type": "js_shell"},
+            {"domain": "notion.so", "failure_type": "js_shell"},
+            {"domain": "medium.com","failure_type": "cloudflare_block"},
+        ]
+
+    def test_failure_type_summary_counts(self) -> None:
+        from source_reader import _failure_type_summary
+        summary = _failure_type_summary(self._make_failures())
+        self.assertEqual(summary["auth_wall"]["count"], 5)
+        self.assertEqual(summary["js_shell"]["count"], 2)
+        self.assertEqual(summary["cloudflare_block"]["count"], 1)
+
+    def test_failure_type_summary_domain_breakdown(self) -> None:
+        from source_reader import _failure_type_summary
+        summary = _failure_type_summary(self._make_failures())
+        # domains for auth_wall should include juejin.cn(3) and x.com(2)
+        domains = summary.get("auth_wall", {}).get("top_domains", {})
+        self.assertEqual(domains.get("juejin.cn"), 3)
+        self.assertEqual(domains.get("x.com"), 2)
+
+    def test_failure_suggestions_uses_failure_type(self) -> None:
+        from source_reader import failure_suggestions
+        failures = self._make_failures()
+        suggestions = failure_suggestions(failures, limit=3)
+        top = suggestions[0]
+        self.assertIn("failure_type", top)
+        self.assertEqual(top["failure_type"], "auth_wall")
+        self.assertGreater(top["count"], 0)
 
 
 if __name__ == "__main__":

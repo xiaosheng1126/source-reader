@@ -31,6 +31,7 @@ READ_DEPTH_BUDGETS = {
     "full": 80000,
 }
 USER_AGENT = "Mozilla/5.0 source-reader/0.1"
+JINA_READER_BASE = "https://r.jina.ai/"
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 RUNS_DIR = ROOT_DIR / ".source-reader" / "runs"
@@ -52,7 +53,9 @@ DEFAULT_BROWSER_PROFILE = ".source-reader/profiles/default"
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from reader_core import config as _reader_config
 from reader_core.actions import needs_auth_assistance
+from reader_core.backends import BackendRegistry, BackendStatus, FunctionBackend, ReadContext
 from reader_core.detectors import (  # noqa: E402
     detect_access_limitation,
     looks_like_auth_wall,
@@ -75,36 +78,233 @@ from reader_core.pdf import read_local_pdf
 from reader_core.utils import cap_text, normalize_space, normalize_text, token_policy
 
 
+def _best_srcset_url(srcset: str) -> str:
+    best_url = ""
+    best_score = -1.0
+    fallback_url = ""
+    for candidate in srcset.split(","):
+        parts = normalize_space(candidate).split()
+        if not parts:
+            continue
+        url = parts[0]
+        if not fallback_url:
+            fallback_url = url
+        score = 0.0
+        if len(parts) > 1:
+            descriptor = parts[1].lower()
+            if descriptor.endswith("w") and descriptor[:-1].isdigit():
+                score = float(descriptor[:-1])
+            elif descriptor.endswith("x"):
+                try:
+                    score = float(descriptor[:-1])
+                except ValueError:
+                    score = 0.0
+        if score > best_score:
+            best_score = score
+            best_url = url
+    return best_url or fallback_url
+
 
 class TextExtractor(html.parser.HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self._skip = 0
         self._in_title = False
+        self._preferred_depth = 0
+        self._in_json_ld = False
         self.title = ""
+        self.meta_title = ""
+        self.description = ""
+        self.base_url = ""
+        self.canonical_url = ""
+        self.site_name = ""
+        self.preview_image = ""
+        self.language = ""
+        self.author = ""
+        self.published_at = ""
+        self.modified_at = ""
+        self.tags: list[str] = []
         self.parts: list[str] = []
+        self.preferred_parts: list[str] = []
+        self.json_ld_blocks: list[str] = []
+        self.links: list[dict[str, str]] = []
+        self.images: list[dict[str, str]] = []
+        self.tables: list[dict[str, object]] = []
+        self.headings: list[dict[str, object]] = []
+        self._heading_stack: list[dict[str, object]] = []
+        self._link_stack: list[dict[str, object]] = []
+        self._figure_stack: list[dict[str, object]] = []
+        self._figcaption_depth = 0
+        self._table_stack: list[dict[str, object]] = []
+        self._table_cell_stack: list[list[str]] = []
+        self._table_caption_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attrs_dict = dict(attrs)
+        tag = tag.lower()
+        attrs_dict = {key.lower(): value for key, value in attrs}
         if tag in {"script", "style", "noscript", "svg", "canvas"}:
             self._skip += 1
+            if tag == "script" and "ld+json" in (attrs_dict.get("type") or "").lower():
+                self._in_json_ld = True
+        if tag == "html":
+            lang = attrs_dict.get("lang") or attrs_dict.get("xml:lang") or ""
+            if lang and not self.language:
+                self.language = normalize_space(lang)
         if tag == "title":
             self._in_title = True
+        if tag in {"article", "main"}:
+            self._preferred_depth += 1
         if tag in {"article", "section", "main", "p", "li", "br", "h1", "h2", "h3", "h4", "pre", "tr"}:
             self.parts.append("\n")
+            if self._preferred_depth:
+                self.preferred_parts.append("\n")
         if tag == "meta":
             name = attrs_dict.get("name") or attrs_dict.get("property") or ""
             content = attrs_dict.get("content") or ""
-            if name in {"og:title", "twitter:title"} and content and not self.title:
-                self.title = content
+            name = name.lower()
+            if name in {"og:title", "twitter:title"} and content and not self.meta_title:
+                self.meta_title = normalize_space(content)
+            if name in {"description", "og:description", "twitter:description"} and content and not self.description:
+                self.description = normalize_space(content)
+            if name == "og:site_name" and content and not self.site_name:
+                self.site_name = normalize_space(content)
+            if name in {"og:image", "twitter:image", "twitter:image:src"} and content and not self.preview_image:
+                self.preview_image = normalize_space(content)
+            if name in {"author", "article:author", "parsely-author", "twitter:creator"} and content and not self.author:
+                self.author = normalize_space(content)
+            if (
+                name
+                in {
+                    "article:published_time",
+                    "date",
+                    "datepublished",
+                    "publishdate",
+                    "pubdate",
+                    "dc.date",
+                    "dc.date.issued",
+                    "sailthru.date",
+                }
+                and content
+                and not self.published_at
+            ):
+                self.published_at = normalize_space(content)
+            if name in {"article:modified_time", "last-modified", "modified_time"} and content and not self.modified_at:
+                self.modified_at = normalize_space(content)
+            if name in {"keywords", "article:tag"} and content:
+                for tag_text in re.split(r"[,，;；]", content):
+                    tag_text = normalize_space(tag_text)
+                    if tag_text and tag_text not in self.tags:
+                        self.tags.append(tag_text)
+        if tag == "link":
+            rel = attrs_dict.get("rel") or ""
+            href = attrs_dict.get("href") or ""
+            if "canonical" in rel.lower() and href and not self.canonical_url:
+                self.canonical_url = normalize_space(href)
+        if tag == "base":
+            href = attrs_dict.get("href") or ""
+            if href and not self.base_url:
+                self.base_url = normalize_space(href)
+        if tag == "a" and self._preferred_depth and not self._skip:
+            href = normalize_space(attrs_dict.get("href") or "")
+            href_lower = href.lower()
+            if href and not href_lower.startswith(("#", "javascript:", "mailto:", "tel:")):
+                self._link_stack.append({"href": href, "parts": []})
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"} and self._preferred_depth and not self._skip:
+            self._heading_stack.append({"level": int(tag[1]), "parts": []})
+        if tag == "figure" and self._preferred_depth and not self._skip:
+            self._figure_stack.append({"image_indexes": [], "caption_parts": []})
+        if tag == "figcaption" and self._figure_stack and not self._skip:
+            self._figcaption_depth += 1
+        if tag == "table" and self._preferred_depth and not self._skip and len(self.tables) < 3:
+            self._table_stack.append({"rows": [], "caption_parts": []})
+        if tag == "caption" and self._table_stack and not self._skip:
+            self._table_caption_depth += 1
+        if tag == "tr" and self._table_stack and not self._skip:
+            current = self._table_stack[-1]
+            if not isinstance(current.get("current_row"), list):
+                current["current_row"] = []
+        if tag in {"td", "th"} and self._table_stack and not self._skip:
+            self._table_cell_stack.append([])
+        if tag == "img" and self._preferred_depth and not self._skip and len(self.images) < 20:
+            src = normalize_space(
+                attrs_dict.get("src")
+                or attrs_dict.get("data-src")
+                or attrs_dict.get("data-original")
+                or attrs_dict.get("data-lazy-src")
+                or _best_srcset_url(attrs_dict.get("srcset") or "")
+                or ""
+            )
+            src_lower = src.lower()
+            if src and not src_lower.startswith(("data:", "javascript:")):
+                image: dict[str, str] = {"url": src}
+                alt = normalize_space(attrs_dict.get("alt") or "")
+                if alt:
+                    image["alt"] = alt[:160]
+                self.images.append(image)
+                if self._figure_stack:
+                    indexes = self._figure_stack[-1].get("image_indexes")
+                    if isinstance(indexes, list):
+                        indexes.append(len(self.images) - 1)
 
     def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "a" and self._link_stack:
+            current = self._link_stack.pop()
+            text = normalize_space(" ".join(str(part) for part in current.get("parts", [])))
+            href = str(current.get("href") or "")
+            if text and href and len(self.links) < 40:
+                self.links.append({"text": text[:160], "url": href})
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"} and self._heading_stack:
+            current = self._heading_stack.pop()
+            text = normalize_space(" ".join(str(part) for part in current.get("parts", [])))
+            level = current.get("level")
+            if text and isinstance(level, int) and len(self.headings) < 40:
+                self.headings.append({"level": level, "text": text[:200]})
+        if tag == "figcaption" and self._figcaption_depth:
+            self._figcaption_depth -= 1
+        if tag == "figure" and self._figure_stack:
+            current = self._figure_stack.pop()
+            caption = normalize_space(" ".join(str(part) for part in current.get("caption_parts", [])))
+            indexes = current.get("image_indexes")
+            if caption and isinstance(indexes, list):
+                for index in indexes:
+                    if isinstance(index, int) and 0 <= index < len(self.images) and "caption" not in self.images[index]:
+                        self.images[index]["caption"] = caption[:240]
+        if tag in {"td", "th"} and self._table_stack and self._table_cell_stack:
+            cell = normalize_space(" ".join(self._table_cell_stack.pop()))
+            current_row = self._table_stack[-1].get("current_row")
+            if isinstance(current_row, list) and len(current_row) < 8:
+                current_row.append(cell[:240])
+        if tag == "tr" and self._table_stack:
+            current = self._table_stack[-1]
+            current_row = current.pop("current_row", None)
+            rows = current.get("rows")
+            if isinstance(current_row, list) and any(current_row) and isinstance(rows, list) and len(rows) < 12:
+                rows.append(current_row)
+        if tag == "caption" and self._table_caption_depth:
+            self._table_caption_depth -= 1
+        if tag == "table" and self._table_stack:
+            current = self._table_stack.pop()
+            rows = current.get("rows")
+            if isinstance(rows, list) and rows:
+                table: dict[str, object] = {"rows": rows[:12]}
+                caption = normalize_space(" ".join(str(part) for part in current.get("caption_parts", [])))
+                if caption:
+                    table["caption"] = caption[:240]
+                self.tables.append(table)
         if tag in {"script", "style", "noscript", "svg", "canvas"} and self._skip:
             self._skip -= 1
+            if tag == "script":
+                self._in_json_ld = False
         if tag == "title":
             self._in_title = False
+        if tag in {"article", "main"} and self._preferred_depth:
+            self._preferred_depth -= 1
 
     def handle_data(self, data: str) -> None:
+        if self._in_json_ld:
+            self.json_ld_blocks.append(data)
+            return
         text = normalize_space(data)
         if not text:
             return
@@ -112,10 +312,178 @@ class TextExtractor(html.parser.HTMLParser):
             self.title += text
         if not self._skip:
             self.parts.append(text)
+            if self._preferred_depth:
+                self.preferred_parts.append(text)
+                if self._link_stack:
+                    parts = self._link_stack[-1].get("parts")
+                    if isinstance(parts, list):
+                        parts.append(text)
+                if self._heading_stack:
+                    parts = self._heading_stack[-1].get("parts")
+                    if isinstance(parts, list):
+                        parts.append(text)
+                if self._figcaption_depth and self._figure_stack:
+                    caption_parts = self._figure_stack[-1].get("caption_parts")
+                    if isinstance(caption_parts, list):
+                        caption_parts.append(text)
+                if self._table_caption_depth and self._table_stack:
+                    caption_parts = self._table_stack[-1].get("caption_parts")
+                    if isinstance(caption_parts, list):
+                        caption_parts.append(text)
+                if self._table_cell_stack:
+                    self._table_cell_stack[-1].append(text)
 
     def text(self) -> str:
-        return normalize_text("\n".join(self.parts))
+        preferred = normalize_text("\n".join(self.preferred_parts))
+        fallback = normalize_text("\n".join(self.parts))
+        if len(preferred) >= 120:
+            return preferred
+        return fallback
 
+    def metadata(self) -> dict[str, object]:
+        preferred = normalize_text("\n".join(self.preferred_parts))
+        data: dict[str, object] = {}
+        if self.title:
+            data["html_title"] = normalize_space(self.title)
+        if self.meta_title:
+            data["html_meta_title"] = self.meta_title
+        if self.description:
+            data["html_description"] = self.description
+        if self.base_url:
+            data["html_base_url"] = self.base_url
+        if self.canonical_url:
+            data["html_canonical_url"] = self.canonical_url
+        if self.site_name:
+            data["html_site_name"] = self.site_name
+        if self.preview_image:
+            data["html_preview_image"] = self.preview_image
+        if self.language:
+            data["html_language"] = self.language
+        if self.author:
+            data["html_author"] = self.author
+        if self.published_at:
+            data["html_published_at"] = self.published_at
+        if self.modified_at:
+            data["html_modified_at"] = self.modified_at
+        if self.tags:
+            data["html_tags"] = self.tags[:20]
+        if self.headings:
+            data["html_headings"] = self.headings[:40]
+        if self.links:
+            data["html_links"] = self.links[:20]
+        if self.images:
+            data["html_images"] = self.images[:10]
+        if self.tables:
+            data["html_tables"] = self.tables[:3]
+        if len(preferred) >= 120:
+            data["html_preferred_region"] = "article_or_main"
+        if self.json_ld_blocks:
+            data["json_ld"] = _json_ld_summary(self.json_ld_blocks)
+        return data
+
+
+def _json_ld_summary(blocks: list[str]) -> dict[str, object]:
+    def _walk(value: object) -> list[dict[str, object]]:
+        if isinstance(value, dict):
+            nodes = [value]
+            graph = value.get("@graph")
+            if isinstance(graph, list):
+                nodes.extend(item for item in graph if isinstance(item, dict))
+            return nodes
+        if isinstance(value, list):
+            nodes: list[dict[str, object]] = []
+            for item in value:
+                nodes.extend(_walk(item))
+            return nodes
+        return []
+
+    def _first_string(value: object) -> str:
+        if isinstance(value, str):
+            return normalize_space(value)
+        if isinstance(value, dict):
+            for key in ("name", "headline", "@id"):
+                text = _first_string(value.get(key))
+                if text:
+                    return text
+        if isinstance(value, list):
+            for item in value:
+                text = _first_string(item)
+                if text:
+                    return text
+        return ""
+
+    def _strings(value: object) -> list[str]:
+        if isinstance(value, str):
+            text = normalize_space(value)
+            return [text] if text else []
+        if isinstance(value, dict):
+            text = _first_string(value)
+            return [text] if text else []
+        if isinstance(value, list):
+            items: list[str] = []
+            for item in value:
+                for text in _strings(item):
+                    if text and text not in items:
+                        items.append(text)
+            return items
+        return []
+
+    def _node_types(value: object) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, str)]
+        return []
+
+    def _summarize_node(node: dict[str, object]) -> dict[str, object]:
+        node_type = node.get("@type")
+        headline = _first_string(node.get("headline")) or _first_string(node.get("name"))
+        description = _first_string(node.get("description"))
+        published = _first_string(node.get("datePublished")) or _first_string(node.get("dateCreated"))
+        modified = _first_string(node.get("dateModified"))
+        author = _first_string(node.get("author"))
+        page_url = _first_string(node.get("url")) or _first_string(node.get("mainEntityOfPage"))
+        image = _first_string(node.get("image"))
+        section = _first_string(node.get("articleSection"))
+        keywords = _strings(node.get("keywords")) or _strings(node.get("about"))
+        return {
+            "type": node_type,
+            "headline": headline,
+            "description": description,
+            "published_at": published,
+            "modified_at": modified,
+            "author": author,
+            "url": page_url,
+            "image": image,
+            "section": section,
+            "keywords": keywords[:20],
+        }
+
+    def _summary_score(summary: dict[str, object]) -> int:
+        score = 0
+        article_types = {"article", "newsarticle", "blogposting", "techarticle", "report", "scholarlyarticle"}
+        if article_types.intersection(type_name.lower() for type_name in _node_types(summary.get("type"))):
+            score += 100
+        for key in ("headline", "description", "published_at", "author", "url", "image", "section"):
+            if summary.get(key):
+                score += 5
+        if summary.get("keywords"):
+            score += 5
+        return score
+
+    candidates: list[dict[str, object]] = []
+    for block in blocks:
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        for node in _walk(parsed):
+            summary = _summarize_node(node)
+            if any(summary.get(key) for key in ("headline", "description", "published_at", "modified_at", "author", "url", "image", "section", "keywords")):
+                candidates.append(summary)
+    if not candidates:
+        return {}
+    return max(candidates, key=_summary_score)
 
 
 def estimate_tokens(text: str) -> int:
@@ -196,7 +564,33 @@ def resolve_browser_profile(browser_profile: str) -> tuple[str, bool, bool]:
     return str(default_path), default_path.exists(), True
 
 
-def build_preview(result: ReaderOutput) -> dict[str, object]:
+def build_read_summary(result: ReaderOutput, source: str) -> dict[str, object]:
+    """Compact summary for Agent consumption — one glance to know quality and next action."""
+    domain = failure_domain(source) if source else "unknown"
+
+    failure_type: str | None = None
+    suggestion: str | None = None
+
+    if result.read_quality in {"blocked", "failed", "partial"}:
+        failure_type = classify_failure_type(result.metadata, result.errors, result.strategy or "")
+        suggestion = suggestion_for_failure(failure_type, domain)
+
+    strategy_chain = result.strategy or ""
+    if result.metadata.get("auto_upgraded"):
+        original = result.metadata.get("original_strategy") or "fast"
+        strategy_chain = f"{original} → {result.strategy}"
+
+    return {
+        "quality": result.read_quality,
+        "strategy_used": strategy_chain,
+        "failure_type": failure_type,
+        "domain": domain,
+        "token_used": estimate_tokens(result.content or ""),
+        "suggestion": suggestion,
+    }
+
+
+def build_preview(result: ReaderOutput, source: str = "") -> dict[str, object]:
     content = result.content or ""
     content_chars = len(content)
     body_length = result.metadata.get("body_length")
@@ -213,6 +607,7 @@ def build_preview(result: ReaderOutput) -> dict[str, object]:
         "headings": extract_headings(content),
         "lead_points": extract_lead_points(content),
         "is_truncated": "clipped" in result.token_policy,
+        "read_summary": build_read_summary(result, source),
     }
 
 
@@ -448,6 +843,23 @@ def build_next_actions(
                 category="auth",
             ),
         )
+    elif (
+        source.startswith(("http://", "https://"))
+        and result.source_type == "webpage"
+        and result.read_quality in {"partial", "blocked", "failed"}
+        and result.metadata.get("external_service") != "jina_reader"
+    ):
+        actions.insert(
+            0,
+            action(
+                "read_with_jina",
+                "用 Jina Reader 重试",
+                "显式通过 Jina Reader 外部服务读取公开网页，适合普通抓取结果为空、JS 外壳或反爬阻断的页面。",
+                command=build_action_command("read_with_jina", source, "md", mode, profile),
+                category="external",
+                adapter="jina_reader",
+            ),
+        )
     return actions
 
 
@@ -474,7 +886,7 @@ def attach_interaction(
     result.read_depth = read_depth
     if not result.confidence:
         result.confidence = score_confidence(result)
-    result.preview = build_preview(result)
+    result.preview = build_preview(result, source)
     result.actions = build_next_actions(
         result,
         source,
@@ -578,6 +990,7 @@ def source_reader_doctor(browser_profile: str = ".source-reader/profiles/default
     return {
         "status": "ok" if all([node_ok, npm_ok, package_json.exists(), browser_reader.exists(), playwright_ok]) else "needs_setup",
         "checks": checks,
+        "backend_capabilities": backend_capabilities(),
         "playwright_message": playwright_message,
         "recommendations": recommendations,
     }
@@ -616,6 +1029,7 @@ def persist_failure_log(result: ReaderOutput, source: str, invocation: dict[str,
         "read_quality": result.read_quality,
         "confidence": result.confidence,
         "strategy": result.strategy,
+        "failure_type": classify_failure_type(result.metadata, result.errors, result.strategy or ""),
         "metadata": result.metadata,
         "errors": result.errors,
         "content_excerpt": (result.content or "")[:2000],
@@ -690,7 +1104,9 @@ def recent_failures_from_logs(limit: int = 10) -> list[dict[str, object]]:
                 "strategy": payload.get("strategy"),
                 "blocked_by": metadata.get("blocked_by"),
                 "auth_assistance_reason": metadata.get("auth_assistance_reason"),
-                "error_type": classify_failure_type(metadata, errors, str(payload.get("strategy") or "")),
+                "failure_type": payload.get("failure_type") or classify_failure_type(
+                    metadata, errors, str(payload.get("strategy") or "")
+                ),
                 "errors": errors,
                 "failure_log_path": display_path(path),
             }
@@ -706,66 +1122,121 @@ def failure_domain(source: str) -> str:
     return suffix or "local_file"
 
 
-def classify_failure_type(metadata: dict[str, object], errors: object, strategy: str) -> str:
-    if metadata.get("blocked_by") == "auth_wall" or metadata.get("auth_assistance_reason"):
-        return "auth"
+def classify_failure_type(metadata: dict[str, object], errors: list | str, strategy: str) -> str:
+    """Classify failure into canonical enum: auth_wall / js_shell / cloudflare_block /
+    http_error / no_content / missing_dependency / unknown."""
     error_text = " ".join(str(item).lower() for item in errors) if isinstance(errors, list) else str(errors).lower()
-    if "yt-dlp not found" in error_text or "no module named 'yt_dlp'" in error_text:
-        return "missing_yt_dlp"
-    if "pypdf not installed" in error_text:
-        return "missing_pypdf"
-    if "pdf has no extractable text" in error_text or strategy == "local_pdf_no_extractable_text":
-        return "pdf_no_text"
-    if "http error 403" in error_text or "challenge solving failed" in error_text:
-        return "anti_bot"
-    if "whisper" in error_text or "groq not configured" in error_text:
-        return "video_transcription"
-    if strategy.startswith("video_") and "subtitle not found" in error_text:
-        return "video_transcription"
+    blocked_by = str(metadata.get("blocked_by") or "")
+
+    if blocked_by == "auth_wall" or metadata.get("auth_assistance_reason"):
+        return "auth_wall"
+    if blocked_by == "cloudflare" or "cloudflare" in error_text or "challenge solving failed" in error_text:
+        return "cloudflare_block"
     if metadata.get("maybe_js_rendered") or "js_shell" in strategy:
         return "js_shell"
-    if metadata.get("blocked_by") == "cloudflare" or "cloudflare" in error_text:
-        return "anti_bot"
-    return "read_failure"
+    if (
+        "yt-dlp not found" in error_text
+        or "no module named 'yt_dlp'" in error_text
+        or "pypdf not installed" in error_text
+        or "playwright is not installed" in error_text
+        or "whisper not installed" in error_text
+    ):
+        return "missing_dependency"
+    if "http request failed" in error_text or "http error 403" in error_text:
+        return "http_error"
+    if not errors and not blocked_by:
+        return "no_content"
+    return "unknown"
 
 
 def failure_suggestions(failures: list[dict[str, object]], limit: int = 5) -> list[dict[str, object]]:
     counts: dict[tuple[str, str], int] = {}
     for item in failures:
         domain = str(item.get("domain") or "unknown")
-        error_type = str(item.get("error_type") or "read_failure")
-        key = (domain, error_type)
+        failure_type = str(item.get("failure_type") or item.get("error_type") or "unknown")
+        key = (domain, failure_type)
         counts[key] = counts.get(key, 0) + 1
     ranked = sorted(counts.items(), key=lambda entry: entry[1], reverse=True)
     suggestions: list[dict[str, object]] = []
-    for (domain, error_type), count in ranked[:limit]:
+    for (domain, failure_type), count in ranked[:limit]:
         suggestions.append(
             {
                 "domain": domain,
-                "error_type": error_type,
+                "failure_type": failure_type,
                 "count": count,
-                "suggestion": suggestion_for_failure(error_type, domain),
+                "suggestion": suggestion_for_failure(failure_type, domain),
             }
         )
     return suggestions
 
 
-def suggestion_for_failure(error_type: str, domain: str) -> str:
-    if error_type == "auth":
-        return f"{domain}: 登录态或权限受限，优先用 read --action login_with_browser 重试。"
-    if error_type == "missing_yt_dlp":
-        return f"{domain}: 缺少视频字幕读取依赖，运行 python3 scripts/install.py --install-yt-dlp。"
-    if error_type == "missing_pypdf":
-        return "本地 PDF: 缺少 pypdf，运行 python3 -m pip install --target .source-reader/vendor pypdf。"
-    if error_type == "pdf_no_text":
-        return "PDF: 没有可提取文本，可能是扫描件；需要用户显式选择在线模型解析或 OCR。"
-    if error_type == "video_transcription":
-        return f"{domain}: 视频无字幕且转写能力不可用；优先配置在线转写，本地 Whisper 作为重型兜底。"
-    if error_type == "js_shell":
-        return f"{domain}: fast 读取疑似 JS 空壳，使用 browser 模式或补站点规则。"
-    if error_type == "anti_bot":
+def suggestion_for_failure(failure_type: str, domain: str) -> str:
+    if failure_type == "auth_wall":
+        return f"{domain}: 登录态或权限受限，优先用 --mode browser --interactive-login 重试。"
+    if failure_type == "cloudflare_block":
         return f"{domain}: 疑似反爬拦截，优先 browser 模式，必要时再启用 Scrapling。"
+    if failure_type == "js_shell":
+        return f"{domain}: fast 读取疑似 JS 空壳，使用 browser 模式或补站点规则。"
+    if failure_type == "missing_dependency":
+        return f"{domain}: 缺少必要依赖，运行 python3 scripts/source_reader.py --doctor 查看安装建议。"
+    if failure_type == "http_error":
+        return f"{domain}: HTTP 请求失败，检查网络或目标服务是否可用。"
+    if failure_type == "no_content":
+        return f"{domain}: 读取结果为空，尝试 browser 模式或检查 URL 是否有效。"
     return f"{domain}: 读取失败样本较多，查看 failure log 后再决定是否补站点规则。"
+
+
+def _load_log_retention_config() -> dict[str, object]:
+    """Load log retention config from config.json, with defaults."""
+    raw = _reader_config.load().get("log_retention")
+    defaults: dict[str, object] = {
+        "mode": "count",
+        "max_runs": 500,
+        "max_days": 30,
+        "keep_failures": True,
+    }
+    if isinstance(raw, dict):
+        defaults.update(raw)
+    return defaults
+
+
+def _gc_logs(
+    runs_dir: pathlib.Path,
+    failures_dir: pathlib.Path,
+    config: dict[str, object] | None = None,
+) -> None:
+    """Garbage-collect run and failure log files per config."""
+    import time as _time
+    if config is None:
+        config = _load_log_retention_config()
+    mode = str(config.get("mode") or "count")
+    max_runs = int(config.get("max_runs") or 500)
+    max_days = int(config.get("max_days") or 30)
+    keep_failures = bool(config.get("keep_failures", True))
+    failures_limit = max_runs * 2 if keep_failures else max_runs
+
+    now = _time.time()
+
+    def _trim_dir(directory: pathlib.Path, limit: int) -> None:
+        if not directory.exists():
+            return
+        files = sorted(directory.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        if mode in {"count", "both"}:
+            excess = files[: max(0, len(files) - limit)]
+            for f in excess:
+                f.unlink(missing_ok=True)
+            files = files[max(0, len(files) - limit):]
+        if mode in {"days", "both"}:
+            cutoff = now - max_days * 86400
+            for f in files:
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    _trim_dir(runs_dir, max_runs)
+    _trim_dir(failures_dir, failures_limit)
 
 
 def persist_run_log(result: ReaderOutput, source: str, invocation: dict[str, object]) -> pathlib.Path:
@@ -782,6 +1253,10 @@ def persist_run_log(result: ReaderOutput, source: str, invocation: dict[str, obj
         "feedback": [],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        _gc_logs(RUNS_DIR, FAILURES_DIR)
+    except Exception:
+        pass
     return path
 
 
@@ -1018,14 +1493,97 @@ def runtime_status() -> dict[str, object]:
     }
 
 
+def _failure_type_summary(failures: list[dict[str, object]]) -> dict[str, object]:
+    """Aggregate failures by failure_type, with per-type domain breakdown (top 5 domains)."""
+    type_counts: dict[str, int] = {}
+    type_domains: dict[str, dict[str, int]] = {}
+    for item in failures:
+        ft = str(item.get("failure_type") or item.get("error_type") or "unknown")
+        domain = str(item.get("domain") or "unknown")
+        type_counts[ft] = type_counts.get(ft, 0) + 1
+        if ft not in type_domains:
+            type_domains[ft] = {}
+        type_domains[ft][domain] = type_domains[ft].get(domain, 0) + 1
+
+    result: dict[str, object] = {}
+    for ft, count in sorted(type_counts.items(), key=lambda x: (-x[1], x[0])):
+        domains = dict(sorted(type_domains[ft].items(), key=lambda x: x[1], reverse=True)[:5])
+        result[ft] = {"count": count, "top_domains": domains}
+    return result
+
+
+def _render_failure_type_summary(summary: dict[str, object]) -> str:
+    """Render failure type summary as markdown lines."""
+    KNOWN_ORDER = ["auth_wall", "js_shell", "cloudflare_block", "http_error", "no_content", "missing_dependency", "unknown"]
+    lines: list[str] = []
+
+    def _render_ft(ft: str) -> str | None:
+        entry = summary.get(ft)
+        if not entry or not isinstance(entry, dict):
+            return None
+        count = entry.get("count", 0)
+        if not count:
+            return None
+        domains: dict[str, int] = entry.get("top_domains") or {}
+        domain_str = ", ".join(f"{d}({n})" for d, n in list(domains.items())[:3])
+        return f"- {ft:<22} {count:>3} 次  {domain_str}"
+
+    for ft in KNOWN_ORDER:
+        line = _render_ft(ft)
+        if line:
+            lines.append(line)
+
+    # Append any unknown types not in KNOWN_ORDER
+    extra_fts = sorted(k for k in summary if k not in KNOWN_ORDER)
+    for ft in extra_fts:
+        line = _render_ft(ft)
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines) if lines else "- (none)"
+
+
+def backend_capabilities() -> list[dict[str, object]]:
+    return [
+        {
+            "id": status.id,
+            "available": status.available,
+            "quality": status.quality,
+            "reason": status.reason,
+            "setup_action_id": status.setup_action_id,
+        }
+        for status in BACKEND_REGISTRY.statuses()
+    ]
+
+
+def _render_backend_capabilities(capabilities: list[object]) -> str:
+    lines: list[str] = []
+    for item in capabilities:
+        if not isinstance(item, dict):
+            continue
+        status = "ok" if item.get("available") else "missing"
+        tail: list[str] = []
+        if item.get("quality"):
+            tail.append(str(item.get("quality")))
+        if item.get("setup_action_id"):
+            tail.append(f"fix={item.get('setup_action_id')}")
+        if item.get("reason"):
+            tail.append(str(item.get("reason")))
+        suffix = f" | {'; '.join(tail)}" if tail else ""
+        lines.append(f"- {item.get('id')}: {status}{suffix}")
+    return "\n".join(lines) if lines else "- (none)"
+
+
 def gather_status(recent_limit: int = 10) -> dict[str, object]:
     recent_failures = recent_failures_from_logs(recent_limit)
     return {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "service": service_status(),
         "profile": profile_status(),
+        "backend_capabilities": backend_capabilities(),
         "recent_reads": recent_reads_from_runs(recent_limit),
         "recent_failures": recent_failures,
+        "failure_type_summary": _failure_type_summary(recent_failures),
         "suggestions": failure_suggestions(recent_failures),
         "playwright": playwright_status(),
         "yt_dlp": yt_dlp_status(),
@@ -1047,6 +1605,8 @@ def status_to_markdown(report: dict[str, object]) -> str:
     runtime = report.get("runtime") if isinstance(report.get("runtime"), dict) else {}
     recent = report.get("recent_reads") if isinstance(report.get("recent_reads"), list) else []
     recent_failures = report.get("recent_failures") if isinstance(report.get("recent_failures"), list) else []
+    backend_caps = report.get("backend_capabilities") if isinstance(report.get("backend_capabilities"), list) else []
+    failure_type_summary = report.get("failure_type_summary") if isinstance(report.get("failure_type_summary"), dict) else {}
     suggestions = report.get("suggestions") if isinstance(report.get("suggestions"), list) else []
 
     if service.get("running"):
@@ -1120,7 +1680,7 @@ def status_to_markdown(report: dict[str, object]) -> str:
             if not isinstance(item, dict):
                 continue
             suggestion_lines.append(
-                f"- {item.get('domain')} | {item.get('error_type')} | count={item.get('count')}: {item.get('suggestion')}"
+                f"- {item.get('domain')} | {item.get('failure_type')} | count={item.get('count')}: {item.get('suggestion')}"
             )
         suggestion_block = "\n".join(suggestion_lines)
     else:
@@ -1146,9 +1706,17 @@ def status_to_markdown(report: dict[str, object]) -> str:
 
 > {profile.get('credential_warning')}
 
+## Backend Capabilities
+
+{_render_backend_capabilities(backend_caps)}
+
 ## Recent Reads (last {len(recent)})
 
 {recent_block}
+
+## 失败类型分析（近 {len(recent_failures)} 次）
+
+{_render_failure_type_summary(failure_type_summary)}
 
 ## Recent Failures (last {len(recent_failures)})
 
@@ -1200,7 +1768,12 @@ def run_status(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Show source-reader status")
     parser.add_argument("--format", choices=["json", "md"], default="md")
     parser.add_argument("--recent", type=int, default=10)
+    parser.add_argument("--gc", action="store_true", help="Run log garbage collection and exit")
     args = parser.parse_args(argv)
+    if args.gc:
+        _gc_logs(RUNS_DIR, FAILURES_DIR)
+        print("Log GC complete.")
+        return 0
     report = gather_status(max(0, args.recent))
     if args.format == "json":
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -1351,10 +1924,71 @@ def decode_body(body: bytes, content_type: str) -> str:
     return body.decode(charset, errors="replace")
 
 
-def extract_html(html: str) -> tuple[str, str]:
+def extract_html_details(html: str) -> tuple[str, str, dict[str, object]]:
     extractor = TextExtractor()
     extractor.feed(html)
-    return extractor.title.strip(), extractor.text()
+    metadata = extractor.metadata()
+    title = str(metadata.get("html_meta_title") or metadata.get("html_title") or "").strip()
+    return title, extractor.text(), metadata
+
+
+def extract_html(html: str) -> tuple[str, str]:
+    title, content, _metadata = extract_html_details(html)
+    return title, content
+
+
+def _resolve_html_metadata_urls(metadata: dict[str, object], base_url: str) -> dict[str, object]:
+    resolved = dict(metadata)
+    metadata_base = resolved.get("html_base_url")
+    if isinstance(metadata_base, str) and metadata_base:
+        base_url = urllib.parse.urljoin(base_url, metadata_base)
+        resolved["html_base_url"] = base_url
+    json_ld = resolved.get("json_ld")
+    if isinstance(json_ld, dict):
+        if not resolved.get("html_canonical_url") and isinstance(json_ld.get("url"), str):
+            resolved["html_canonical_url"] = json_ld["url"]
+        if not resolved.get("html_preview_image") and isinstance(json_ld.get("image"), str):
+            resolved["html_preview_image"] = json_ld["image"]
+    for key in ("html_canonical_url", "html_preview_image"):
+        value = resolved.get(key)
+        if isinstance(value, str) and value:
+            resolved[key] = urllib.parse.urljoin(base_url, value)
+    links = resolved.get("html_links")
+    if isinstance(links, list):
+        resolved_links: list[dict[str, str]] = []
+        for item in links:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            url = item.get("url")
+            if isinstance(text, str) and isinstance(url, str) and text and url:
+                resolved_links.append({"text": text, "url": urllib.parse.urljoin(base_url, url)})
+        if resolved_links:
+            resolved["html_links"] = resolved_links[:20]
+        else:
+            resolved.pop("html_links", None)
+    images = resolved.get("html_images")
+    if isinstance(images, list):
+        resolved_images: list[dict[str, str]] = []
+        for item in images:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            image = {"url": urllib.parse.urljoin(base_url, url)}
+            alt = item.get("alt")
+            if isinstance(alt, str) and alt:
+                image["alt"] = alt
+            caption = item.get("caption")
+            if isinstance(caption, str) and caption:
+                image["caption"] = caption
+            resolved_images.append(image)
+        if resolved_images:
+            resolved["html_images"] = resolved_images[:10]
+        else:
+            resolved.pop("html_images", None)
+    return resolved
 
 
 def read_basic_url(url: str, max_chars: int) -> ReaderOutput:
@@ -1377,8 +2011,10 @@ def read_basic_url(url: str, max_chars: int) -> ReaderOutput:
         )
     decoded = decode_body(body, content_type)
     is_html = "html" in content_type or decoded.lstrip().startswith("<")
+    html_metadata: dict[str, object] = {}
     if is_html:
-        title, content = extract_html(decoded)
+        title, content, html_metadata = extract_html_details(decoded)
+        html_metadata = _resolve_html_metadata_urls(html_metadata, final_url)
         strategy = "html_text_extraction"
     else:
         title, content = final_url, decoded
@@ -1390,6 +2026,15 @@ def read_basic_url(url: str, max_chars: int) -> ReaderOutput:
         "content_type": content_type,
         "requested_url": url,
     }
+    metadata.update(html_metadata)
+    json_ld = html_metadata.get("json_ld") if isinstance(html_metadata.get("json_ld"), dict) else {}
+    author = ""
+    published_at = ""
+    if isinstance(json_ld, dict):
+        author = str(json_ld.get("author") or "")
+        published_at = str(json_ld.get("published_at") or "")
+    author = author or str(html_metadata.get("html_author") or "")
+    published_at = published_at or str(html_metadata.get("html_published_at") or "")
     errors: list[str] = []
     read_quality = "basic" if content else "partial"
     if auth_wall:
@@ -1406,12 +2051,208 @@ def read_basic_url(url: str, max_chars: int) -> ReaderOutput:
         source_type="webpage",
         title=title or final_url,
         url=final_url,
+        author=author,
+        published_at=published_at,
         read_quality=read_quality,
         strategy=strategy,
         token_policy=token_policy(max_chars, clipped),
         content=content or "读取结果为空。",
         metadata=metadata,
         errors=errors,
+    )
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def _xml_child_text(node: object, names: set[str]) -> str:
+    for child in list(node):  # type: ignore[arg-type]
+        if _xml_local_name(child.tag) in names:
+            return normalize_text("".join(child.itertext()))
+    return ""
+
+
+def _xml_child_attr(node: object, child_name: str, attr_name: str) -> str:
+    for child in list(node):  # type: ignore[arg-type]
+        if _xml_local_name(child.tag) == child_name:
+            value = child.attrib.get(attr_name)
+            if value:
+                return str(value)
+    return ""
+
+
+def _feed_item_limit(read_depth: str) -> int:
+    if read_depth == "full":
+        return 50
+    if read_depth == "preview":
+        return 8
+    return 20
+
+
+def read_feed_url(url: str, max_chars: int, read_depth: str = "standard") -> ReaderOutput:
+    import xml.etree.ElementTree as ET
+
+    try:
+        body, content_type, final_url = request_url(url)
+    except RuntimeError as exc:
+        return ReaderOutput(
+            input_type="url",
+            source_type="feed",
+            title=url,
+            url=url,
+            read_quality="failed",
+            strategy="feed_xml_parse",
+            token_policy=token_policy(max_chars, False),
+            content="",
+            metadata={"requested_url": url},
+            errors=[f"HTTP request failed: {exc}"],
+        )
+
+    decoded = decode_body(body, content_type)
+    try:
+        root = ET.fromstring(decoded)
+    except ET.ParseError as exc:
+        is_html = "html" in content_type or decoded.lstrip().startswith("<!doctype") or decoded.lstrip().startswith("<html")
+        title, content = extract_html(decoded) if is_html else (final_url, decoded)
+        content, clipped = cap_text(content, max_chars)
+        return ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title=title or final_url,
+            url=final_url,
+            read_quality="partial" if content else "failed",
+            strategy="feed_xml_parse_failed_plain_text_fallback",
+            token_policy=token_policy(max_chars, clipped),
+            content=content,
+            metadata={"content_type": content_type, "requested_url": url},
+            errors=[f"Feed XML parse failed: {exc}"],
+        )
+
+    root_name = _xml_local_name(root.tag)
+    item_limit = _feed_item_limit(read_depth)
+    title = ""
+    description = ""
+    items: list[dict[str, str]] = []
+
+    if root_name == "rss":
+        channel = next((child for child in list(root) if _xml_local_name(child.tag) == "channel"), root)
+        title = _xml_child_text(channel, {"title"})
+        description = _xml_child_text(channel, {"description", "subtitle"})
+        for item in [child for child in list(channel) if _xml_local_name(child.tag) == "item"][:item_limit]:
+            items.append(
+                {
+                    "title": _xml_child_text(item, {"title"}),
+                    "link": _xml_child_text(item, {"link"}),
+                    "published": _xml_child_text(item, {"pubdate", "published", "updated", "date"}),
+                    "summary": _xml_child_text(item, {"description", "summary", "content"}),
+                }
+            )
+    elif root_name == "feed":
+        title = _xml_child_text(root, {"title"})
+        description = _xml_child_text(root, {"subtitle", "description"})
+        entries = [child for child in list(root) if _xml_local_name(child.tag) == "entry"]
+        for entry in entries[:item_limit]:
+            items.append(
+                {
+                    "title": _xml_child_text(entry, {"title"}),
+                    "link": _xml_child_attr(entry, "link", "href") or _xml_child_text(entry, {"link"}),
+                    "published": _xml_child_text(entry, {"published", "updated", "issued"}),
+                    "summary": _xml_child_text(entry, {"summary", "content"}),
+                }
+            )
+    else:
+        content, clipped = cap_text(decoded, max_chars)
+        return ReaderOutput(
+            input_type="url",
+            source_type="feed",
+            title=final_url,
+            url=final_url,
+            read_quality="partial",
+            strategy="feed_xml_unknown_root_plain_text_fallback",
+            token_policy=token_policy(max_chars, clipped),
+            content=content,
+            metadata={"content_type": content_type, "requested_url": url, "root": root_name},
+            errors=[f"Unsupported feed root: {root_name}"],
+        )
+
+    lines = [f"# {title or final_url}"]
+    if description:
+        lines.extend(["", description])
+    if items:
+        lines.append("\n## Items")
+    for index, item in enumerate(items, start=1):
+        lines.append(f"\n### {index}. {item.get('title') or '(untitled)'}")
+        if item.get("published"):
+            lines.append(f"- Published: {item['published']}")
+        if item.get("link"):
+            lines.append(f"- Link: {item['link']}")
+        if item.get("summary"):
+            lines.extend(["", item["summary"]])
+
+    content, clipped = cap_text("\n".join(lines), max_chars)
+    return ReaderOutput(
+        input_type="url",
+        source_type="feed",
+        title=title or final_url,
+        url=final_url,
+        read_quality="targeted" if items else "partial",
+        strategy="feed_items_summary",
+        token_policy=token_policy(max_chars, clipped),
+        content=content,
+        metadata={
+            "content_type": content_type,
+            "requested_url": url,
+            "feed_type": root_name,
+            "items_read": len(items),
+            "item_limit": item_limit,
+        },
+        errors=[] if items else ["Feed parsed but no items found"],
+    )
+
+
+def jina_reader_url(url: str) -> str:
+    return JINA_READER_BASE + url
+
+
+def read_jina_url(url: str, max_chars: int) -> ReaderOutput:
+    reader_url = jina_reader_url(url)
+    try:
+        body, content_type, final_url = request_url(reader_url)
+    except RuntimeError as exc:
+        return ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title=url,
+            url=url,
+            read_quality="failed",
+            strategy="jina_reader_markdown",
+            token_policy=token_policy(max_chars, False),
+            content="",
+            metadata={
+                "requested_url": url,
+                "reader_url": reader_url,
+                "external_service": "jina_reader",
+            },
+            errors=[f"Jina Reader request failed: {exc}"],
+        )
+    content, clipped = cap_text(decode_body(body, content_type), max_chars)
+    return ReaderOutput(
+        input_type="url",
+        source_type="webpage",
+        title=url,
+        url=url,
+        read_quality="targeted" if content else "partial",
+        strategy="jina_reader_markdown",
+        token_policy=token_policy(max_chars, clipped),
+        content=content,
+        metadata={
+            "content_type": content_type,
+            "requested_url": url,
+            "reader_url": final_url or reader_url,
+            "external_service": "jina_reader",
+        },
+        errors=[] if content else ["Jina Reader returned empty content"],
     )
 
 
@@ -1624,6 +2465,159 @@ def read_github_repo_readme(owner: str, repo: str, original_url: str, max_chars:
     )
 
 
+GITHUB_DEEP_ROOT_FILES = {
+    "readme",
+    "readme.md",
+    "readme.rst",
+    "readme.txt",
+    "pyproject.toml",
+    "package.json",
+    "cargo.toml",
+    "go.mod",
+    "requirements.txt",
+    "setup.py",
+    "setup.cfg",
+    "gemfile",
+    "composer.json",
+}
+
+GITHUB_DEEP_DOC_EXTENSIONS = (".md", ".rst", ".txt")
+
+
+def _github_default_branch(owner: str, repo: str) -> tuple[str, list[str]]:
+    errors: list[str] = []
+    try:
+        repo_info = github_api(f"https://api.github.com/repos/{owner}/{repo}")
+    except Exception as exc:
+        errors.append(f"repo metadata: {exc}")
+        return "main", errors
+    if isinstance(repo_info, dict):
+        branch = str(repo_info.get("default_branch") or "").strip()
+        if branch:
+            return branch, errors
+    errors.append("repo metadata: missing default_branch")
+    return "main", errors
+
+
+def _github_tree_paths(owner: str, repo: str, branch: str) -> tuple[list[str], bool, list[str]]:
+    errors: list[str] = []
+    quoted_branch = urllib.parse.quote(branch, safe="")
+    try:
+        tree_data = github_api(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{quoted_branch}?recursive=1")
+    except Exception as exc:
+        errors.append(f"repo tree: {exc}")
+        return [], False, errors
+    if not isinstance(tree_data, dict):
+        return [], False, ["repo tree: unexpected response"]
+    tree = tree_data.get("tree")
+    if not isinstance(tree, list):
+        return [], bool(tree_data.get("truncated")), ["repo tree: missing tree"]
+    paths: list[str] = []
+    for item in tree:
+        if not isinstance(item, dict) or item.get("type") != "blob":
+            continue
+        path = str(item.get("path") or "").strip()
+        if path:
+            paths.append(path)
+    return paths, bool(tree_data.get("truncated")), errors
+
+
+def _github_deep_path_score(path: str) -> tuple[int, int, str]:
+    lower = path.lower()
+    name = lower.rsplit("/", 1)[-1]
+    depth = lower.count("/")
+    if name.startswith("readme"):
+        return (0, depth, lower)
+    if lower.startswith("docs/") and lower.endswith(GITHUB_DEEP_DOC_EXTENSIONS):
+        return (1, depth, lower)
+    if "/" not in lower and name in GITHUB_DEEP_ROOT_FILES:
+        return (2, depth, lower)
+    return (9, depth, lower)
+
+
+def _select_github_deep_paths(paths: list[str], limit: int = 14) -> list[str]:
+    selected: list[str] = []
+    for path in sorted(paths, key=_github_deep_path_score):
+        lower = path.lower()
+        name = lower.rsplit("/", 1)[-1]
+        if name.startswith("readme"):
+            selected.append(path)
+        elif lower.startswith("docs/") and lower.endswith(GITHUB_DEEP_DOC_EXTENSIONS):
+            selected.append(path)
+        elif "/" not in lower and name in GITHUB_DEEP_ROOT_FILES:
+            selected.append(path)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def read_github_repo_deep(owner: str, repo: str, original_url: str, max_chars: int) -> ReaderOutput:
+    errors: list[str] = []
+    branch, branch_errors = _github_default_branch(owner, repo)
+    errors.extend(branch_errors)
+    paths, tree_truncated, tree_errors = _github_tree_paths(owner, repo, branch)
+    errors.extend(tree_errors)
+    selected_paths = _select_github_deep_paths(paths)
+
+    if not selected_paths:
+        result = read_github_repo_readme(owner, repo, original_url, max_chars)
+        result.metadata["deep_read_fallback"] = True
+        result.metadata["deep_read_errors"] = errors
+        result.errors.extend(errors)
+        return result
+
+    sections: list[str] = []
+    fetch_errors: list[str] = []
+    per_file_budget = max(1200, max_chars // max(1, len(selected_paths)))
+    for path in selected_paths:
+        try:
+            body, content_type, final_url = request_url(raw_github_url(owner, repo, branch, path))
+            file_content = decode_body(body, content_type)
+        except Exception as exc:
+            fetch_errors.append(f"{path}: {exc}")
+            continue
+        file_content, file_clipped = cap_text(file_content, per_file_budget)
+        clipped_note = "\n\n[clipped]" if file_clipped else ""
+        sections.append(f"## {path}\n\n{file_content}{clipped_note}")
+
+    errors.extend(fetch_errors)
+    if not sections:
+        result = read_github_repo_readme(owner, repo, original_url, max_chars)
+        result.metadata["deep_read_fallback"] = True
+        result.metadata["deep_read_errors"] = errors
+        result.errors.extend(errors)
+        return result
+
+    header = [
+        f"# {owner}/{repo}",
+        "",
+        f"Branch: {branch}",
+        f"Files read: {len(sections)}",
+        "",
+    ]
+    content, clipped = cap_text("\n".join(header + sections), max_chars)
+    return ReaderOutput(
+        input_type="url",
+        source_type="github_repo",
+        title=f"{owner}/{repo} repository overview",
+        url=original_url,
+        read_quality="targeted",
+        strategy="github_repo_selected_docs_and_manifests",
+        token_policy=token_policy(max_chars, clipped),
+        content=content,
+        metadata={
+            "owner": owner,
+            "repo": repo,
+            "branch": branch,
+            "deep_read": True,
+            "tree_truncated": tree_truncated,
+            "paths": selected_paths,
+            "files_read": len(sections),
+        },
+        errors=errors,
+    )
+
+
 def read_github_blob(owner: str, repo: str, parts: list[str], original_url: str, max_chars: int) -> ReaderOutput:
     branch = parts[2]
     path = "/".join(parts[3:])
@@ -1741,7 +2735,7 @@ def read_gist(parts: list[str], original_url: str, max_chars: int) -> ReaderOutp
     )
 
 
-def read_github(url: str, max_chars: int) -> ReaderOutput:
+def read_github(url: str, max_chars: int, read_depth: str = "standard") -> ReaderOutput:
     parsed = urllib.parse.urlparse(url)
     parts = [part for part in parsed.path.strip("/").split("/") if part]
     if parsed.netloc == "gist.github.com":
@@ -1751,6 +2745,8 @@ def read_github(url: str, max_chars: int) -> ReaderOutput:
     owner, repo = parts[0], parts[1]
     rest = parts[2:]
     if not rest:
+        if read_depth == "full":
+            return read_github_repo_deep(owner, repo, url, max_chars)
         return read_github_repo_readme(owner, repo, url, max_chars)
     if rest[0] == "blob" and len(rest) >= 3:
         return read_github_blob(owner, repo, rest, url, max_chars)
@@ -1759,7 +2755,7 @@ def read_github(url: str, max_chars: int) -> ReaderOutput:
     if rest[0] == "releases":
         return read_github_release(owner, repo, rest, url, max_chars)
     if rest[0] == "tree":
-        result = read_github_repo_readme(owner, repo, url, max_chars)
+        result = read_github_repo_deep(owner, repo, url, max_chars) if read_depth == "full" else read_github_repo_readme(owner, repo, url, max_chars)
         result.strategy = "github_tree_fallback_repo_readme_only"
         result.metadata["requested_path"] = "/".join(rest)
         return result
@@ -1836,6 +2832,195 @@ def read_file(path_text: str, max_chars: int) -> ReaderOutput:
     )
 
 
+def _is_url(source: str) -> bool:
+    return source.startswith(("http://", "https://"))
+
+
+def _host_and_path(source: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlparse(source)
+    return parsed.netloc.lower(), parsed.path.lower()
+
+
+def _looks_like_feed_url(source: str) -> bool:
+    parsed = urllib.parse.urlparse(source)
+    path = parsed.path.lower().rstrip("/")
+    name = path.rsplit("/", 1)[-1]
+    if path.endswith((".rss", ".atom", ".xml")):
+        return True
+    if name in {"feed", "rss", "atom", "feeds"}:
+        return True
+    return "/feed/" in path or "/rss/" in path or "/atom/" in path
+
+
+def _read_browser_backend(context: ReadContext) -> ReaderOutput:
+    if not context.browser_profile:
+        return ReaderOutput(
+            input_type="url",
+            source_type="webpage",
+            title=context.source,
+            url=context.source,
+            read_quality="failed",
+            strategy="playwright_persistent_profile",
+            token_policy=token_policy(context.max_chars, False),
+            content="",
+            errors=["--browser-profile is required when --mode browser is used."],
+        )
+    return read_browser_url(
+        context.source,
+        context.max_chars,
+        context.browser_profile,
+        headless=context.headless,
+        interactive_login=context.interactive_login,
+        login_timeout_ms=context.login_timeout_ms,
+    )
+
+
+def build_backend_registry() -> BackendRegistry:
+    registry = BackendRegistry()
+    registry.register(
+        FunctionBackend(
+            id="local_file",
+            priority=10,
+            predicate=lambda source, _mode: not _is_url(source),
+            reader=lambda context: read_file(context.source, context.max_chars),
+            status_reader=lambda: BackendStatus("local_file", True, quality="builtin"),
+        )
+    )
+    registry.register(
+        FunctionBackend(
+            id="browser_web",
+            priority=20,
+            predicate=lambda source, mode: _is_url(source) and mode == "browser",
+            reader=_read_browser_backend,
+            status_reader=lambda: BackendStatus(
+                "browser_web",
+                playwright_installed(),
+                reason="" if playwright_installed() else "Playwright is not installed",
+                setup_action_id="" if playwright_installed() else "install_playwright",
+                quality="optional",
+            ),
+        )
+    )
+    registry.register(
+        FunctionBackend(
+            id="scrapling_web",
+            priority=30,
+            predicate=lambda source, mode: _is_url(source) and mode == "scrapling",
+            reader=lambda context: read_scrapling_url(context.source, context.max_chars),
+            status_reader=lambda: BackendStatus(
+                "scrapling_web",
+                scrapling_installed(),
+                reason="" if scrapling_installed() else "Scrapling is not installed",
+                setup_action_id="" if scrapling_installed() else "install_scrapling",
+                quality="optional_heavy",
+            ),
+        )
+    )
+    registry.register(
+        FunctionBackend(
+            id="github",
+            priority=40,
+            predicate=lambda source, mode: (
+                _is_url(source)
+                and mode in {"fast", "auto"}
+                and _host_and_path(source)[0] in {"github.com", "gist.github.com"}
+            ),
+            reader=lambda context: read_github(context.source, context.max_chars, context.read_depth),
+            status_reader=lambda: BackendStatus("github", True, quality="builtin"),
+        )
+    )
+    registry.register(
+        FunctionBackend(
+            id="media",
+            priority=50,
+            predicate=lambda source, mode: (
+                _is_url(source)
+                and mode in {"fast", "auto"}
+                and matches_video_host(_host_and_path(source)[0])
+            ),
+            reader=lambda context: read_video(context.source, context.max_chars),
+            status_reader=lambda: BackendStatus(
+                "media",
+                bool(yt_dlp_status().get("installed")),
+                reason="" if yt_dlp_status().get("installed") else "yt-dlp is not installed",
+                setup_action_id="" if yt_dlp_status().get("installed") else "install_yt_dlp",
+                quality="optional",
+            ),
+        )
+    )
+    registry.register(
+        FunctionBackend(
+            id="discussion",
+            priority=60,
+            predicate=lambda source, mode: (
+                _is_url(source)
+                and mode in {"fast", "auto"}
+                and (
+                    _host_and_path(source)[0]
+                    in {"news.ycombinator.com", "www.reddit.com", "reddit.com", "v2ex.com", "www.v2ex.com"}
+                    or _host_and_path(source)[0].endswith(".reddit.com")
+                )
+            ),
+            reader=lambda context: read_discussion(context.source, context.max_chars),
+            status_reader=lambda: BackendStatus("discussion", True, quality="builtin_basic"),
+        )
+    )
+    registry.register(
+        FunctionBackend(
+            id="pdf_url",
+            priority=70,
+            predicate=lambda source, mode: (
+                _is_url(source)
+                and mode in {"fast", "auto"}
+                and (_host_and_path(source)[1].endswith(".pdf") or "arxiv.org/pdf/" in source)
+            ),
+            reader=lambda context: read_pdf(context.source, context.max_chars),
+            status_reader=lambda: BackendStatus(
+                "pdf_url",
+                True,
+                reason="URL PDF defaults to safe non-upload fallback",
+                quality="builtin_limited",
+            ),
+        )
+    )
+    registry.register(
+        FunctionBackend(
+            id="feed",
+            priority=75,
+            predicate=lambda source, mode: _is_url(source) and mode in {"fast", "auto"} and _looks_like_feed_url(source),
+            reader=lambda context: read_feed_url(context.source, context.max_chars, context.read_depth),
+            status_reader=lambda: BackendStatus("feed", True, quality="builtin"),
+        )
+    )
+    registry.register(
+        FunctionBackend(
+            id="jina_reader",
+            priority=78,
+            predicate=lambda source, mode: _is_url(source) and mode == "jina",
+            reader=lambda context: read_jina_url(context.source, context.max_chars),
+            status_reader=lambda: BackendStatus(
+                "jina_reader",
+                True,
+                reason="Explicit external fallback only",
+                quality="external_optional",
+            ),
+        )
+    )
+    registry.register(
+        FunctionBackend(
+            id="fast_web",
+            priority=80,
+            predicate=lambda source, mode: _is_url(source) and mode in {"fast", "auto"},
+            reader=lambda context: read_basic_url(context.source, context.max_chars),
+            status_reader=lambda: BackendStatus("fast_web", True, quality="builtin"),
+        )
+    )
+    return registry
+
+
+BACKEND_REGISTRY = build_backend_registry()
+
+
 
 def effective_max_chars(max_chars: int, read_depth: str) -> int:
     if max_chars != DEFAULT_MAX_CHARS:
@@ -1908,6 +3093,7 @@ def _try_auto_upgrade(
         "errors": result.errors,
     }
     browser_result.metadata["auto_upgraded"] = True
+    browser_result.metadata["original_strategy"] = result.strategy or "fast"
     browser_result.metadata["auto_upgrade_reason"] = _auto_upgrade_reason(result)
     if used_default:
         browser_result.metadata["browser_profile_default"] = True
@@ -1927,6 +3113,7 @@ def _try_auto_upgrade(
                 "browser": {"read_quality": browser_result.read_quality, "confidence": browser_conf},
             }
             scrapling_result.metadata["auto_upgraded"] = True
+            scrapling_result.metadata["original_strategy"] = result.strategy or "fast"
             scrapling_result.metadata["auto_upgrade_reason"] = "scrapling_anti_bot"
             return scrapling_result
 
@@ -1945,47 +3132,24 @@ def classify_and_read(
     auto_upgrade: bool = True,
 ) -> ReaderOutput:
     max_chars = effective_max_chars(max_chars, read_depth)
-
-    if not source.startswith(("http://", "https://")):
-        result = read_file(source, max_chars)
-    elif mode == "browser":
-        if not browser_profile:
-            result = ReaderOutput(
-                input_type="url",
-                source_type="webpage",
-                title=source,
-                url=source,
-                read_quality="failed",
-                strategy="playwright_persistent_profile",
-                token_policy=token_policy(max_chars, False),
-                content="",
-                errors=["--browser-profile is required when --mode browser is used."],
-            )
-        else:
-            result = read_browser_url(
-                source,
-                max_chars,
-                browser_profile,
-                headless=headless,
-                interactive_login=interactive_login,
-                login_timeout_ms=login_timeout_ms,
-            )
-    elif mode == "scrapling":
-        result = read_scrapling_url(source, max_chars)
+    context = ReadContext(
+        source=source,
+        mode=mode,
+        read_depth=read_depth,
+        max_chars=max_chars,
+        browser_profile=browser_profile,
+        headless=headless,
+        interactive_login=interactive_login,
+        login_timeout_ms=login_timeout_ms,
+    )
+    candidates = BACKEND_REGISTRY.candidates(source, mode)
+    if not candidates:
+        result = read_basic_url(source, max_chars) if _is_url(source) else read_file(source, max_chars)
     else:
-        parsed = urllib.parse.urlparse(source)
-        host = parsed.netloc.lower()
-        path = parsed.path.lower()
-        if host in {"github.com", "gist.github.com"}:
-            result = read_github(source, max_chars)
-        elif matches_video_host(host):
-            result = read_video(source, max_chars)
-        elif host in {"news.ycombinator.com", "www.reddit.com", "reddit.com", "v2ex.com", "www.v2ex.com"} or host.endswith(".reddit.com"):
-            result = read_discussion(source, max_chars)
-        elif path.endswith(".pdf") or "arxiv.org/pdf/" in source:
-            result = read_pdf(source, max_chars)
-        else:
-            result = read_basic_url(source, max_chars)
+        backend = candidates[0]
+        result = backend.read(context)
+        result.metadata.setdefault("backend_id", backend.id)
+        if backend.id == "fast_web":
             result.confidence = score_confidence(result)
             if auto_upgrade and mode in {"fast", "auto"} and _should_auto_upgrade(result):
                 result = _try_auto_upgrade(
@@ -1997,6 +3161,7 @@ def classify_and_read(
                     interactive_login,
                     login_timeout_ms,
                 )
+                result.metadata.setdefault("backend_id", "browser_web")
 
     return attach_interaction(
         result,
@@ -2085,6 +3250,9 @@ def doctor_to_markdown(report: dict[str, object]) -> str:
     recommendations = report.get("recommendations", [])
     if not isinstance(recommendations, list):
         recommendations = []
+    backend_caps = report.get("backend_capabilities")
+    if not isinstance(backend_caps, list):
+        backend_caps = []
     check_lines = "\n".join(
         f"- {key}: {value}"
         for key, value in checks.items()
@@ -2097,6 +3265,10 @@ def doctor_to_markdown(report: dict[str, object]) -> str:
 ## Checks
 
 {check_lines}
+
+## Backend Capabilities
+
+{_render_backend_capabilities(backend_caps)}
 
 ## Recommendations
 
@@ -2146,6 +3318,8 @@ def action_read_depth(action_id: str) -> tuple[str, str]:
         return "preview", "outline"
     if action_id == "extract_code":
         return "standard", "code"
+    if action_id in {"read_with_jina", "jina_reader"}:
+        return "standard", "jina"
     if action_id in {"login_with_browser", "retry_with_login", "retry_with_profile"}:
         return "preview", "auth"
     raise SystemExit(f"unsupported action: {action_id}")
@@ -2208,7 +3382,7 @@ def run_action(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     read_depth, focus = action_read_depth(args.action_id)
-    mode = "browser" if focus == "auth" else args.mode
+    mode = "browser" if focus == "auth" else "jina" if focus == "jina" else args.mode
     interactive_login = args.interactive_login or focus == "auth"
     result = classify_and_read(
         args.source,
@@ -2223,7 +3397,7 @@ def run_action(argv: list[str]) -> int:
     )
     result.metadata["action_id"] = args.action_id
     result = apply_focus_hint(result, focus)
-    result.preview = build_preview(result)
+    result.preview = build_preview(result, args.source)
     result.actions = build_next_actions(
         result,
         args.source,
@@ -2447,7 +3621,7 @@ class SourceReaderHandler(http.server.BaseHTTPRequestHandler):
         if not action_id:
             raise ValueError("action_id is required")
         read_depth, focus = action_read_depth(action_id)
-        mode = "browser" if focus == "auth" else str(payload.get("mode") or "auto")
+        mode = "browser" if focus == "auth" else "jina" if focus == "jina" else str(payload.get("mode") or "auto")
         interactive_login = bool(payload.get("interactive_login") or False) or focus == "auth"
         browser_profile = str(payload.get("browser_profile") or ".source-reader/profiles/default")
         result = classify_and_read(
@@ -2462,7 +3636,7 @@ class SourceReaderHandler(http.server.BaseHTTPRequestHandler):
         )
         result.metadata["action_id"] = action_id
         result = apply_focus_hint(result, focus)
-        result.preview = build_preview(result)
+        result.preview = build_preview(result, source)
         result.actions = build_next_actions(
             result,
             source,
@@ -2668,7 +3842,7 @@ def mcp_tool_schema() -> list[dict[str, object]]:
         },
         {
             "name": "source_reader_action",
-            "description": "Execute a source-reader action such as continue_deep_read, extract_outline, extract_code, or login_with_browser.",
+            "description": "Execute a source-reader action such as continue_deep_read, extract_outline, extract_code, login_with_browser, or read_with_jina.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2721,7 +3895,7 @@ def mcp_call_tool(name: str, arguments: dict[str, object]) -> dict[str, object]:
         if not source or not action_id:
             raise ValueError("source and action_id are required")
         read_depth, focus = action_read_depth(action_id)
-        mode = "browser" if focus == "auth" else "auto"
+        mode = "browser" if focus == "auth" else "jina" if focus == "jina" else "auto"
         result = classify_and_read(
             source,
             DEFAULT_MAX_CHARS,
@@ -2734,7 +3908,7 @@ def mcp_call_tool(name: str, arguments: dict[str, object]) -> dict[str, object]:
         )
         result.metadata["action_id"] = action_id
         result = apply_focus_hint(result, focus)
-        result.preview = build_preview(result)
+        result.preview = build_preview(result, source)
         result.actions = build_next_actions(result, source, mode, ".source-reader/profiles/default", False, focus == "auth", 180000)
         result.next_actions = result.actions
         persist_run_log(result, source, {"command": "mcp_action", "action_id": action_id})
@@ -2835,7 +4009,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--interactive-login", action="store_true", help="wait for manual login when browser mode reaches an auth page")
     parser.add_argument("--login-timeout-ms", type=int, default=180000, help="manual login wait timeout in milliseconds")
     parser.add_argument("--no-auto-upgrade", action="store_true", help="disable automatic browser upgrade when fast read confidence is low")
-    parser.add_argument("--action", help="run a source-reader action on the source (continue_deep_read | extract_outline | extract_code | login_with_browser)")
+    parser.add_argument("--action", help="run a source-reader action on the source (continue_deep_read | extract_outline | extract_code | login_with_browser | read_with_jina)")
     parser.add_argument("--feedback", choices=["good", "bad"], help="record a feedback verdict (requires --run-id)")
     parser.add_argument("--run-id", default="", help="run id for --feedback")
     parser.add_argument("--reason", default="", help="reason text for --feedback bad")
